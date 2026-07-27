@@ -706,6 +706,11 @@ namespace platf {
   std::unique_ptr<audio_control_t> audio_control();
 
   /**
+   * @brief Check for an active microphone redirect endpoint without initializing it.
+   */
+  bool mic_redirect_available();
+
+  /**
    * @brief Get the display_t instance for the given hwdevice_type.
    * If display_name is empty, use the first monitor that's compatible you can find
    * If you require to use this parameter in a separate thread, make a copy of it.

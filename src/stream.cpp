@@ -549,7 +549,6 @@ namespace stream {
     // "UDP arrived but didn't match a session" when waiting for pings.
     std::atomic<std::uint64_t> video_recv_count {0};
     std::atomic<std::uint64_t> audio_recv_count {0};
-    std::atomic<std::uint64_t> mic_recv_count {0};
 
     std::thread recv_thread;
     std::thread video_thread;
@@ -567,8 +566,15 @@ namespace stream {
 
     std::atomic<bool> mic_socket_enabled {false};
     std::atomic<int> mic_sessions_count {0};
+    std::mutex mic_start_mutex;
 
     control_server_t control_server;
+  };
+
+  struct mic_seq_order_t {
+    bool operator()(std::uint16_t left, std::uint16_t right) const {
+      return static_cast<std::int16_t>(left - right) < 0;
+    }
   };
 
   struct session_t {
@@ -681,7 +687,7 @@ namespace stream {
         std::vector<std::uint8_t> opus;
         std::uint16_t seq = 0;
       };
-      std::map<std::uint16_t, queued_t> pending;
+      std::map<std::uint16_t, queued_t, mic_seq_order_t> pending;
       bool has_playout_cursor = false;
       std::uint16_t expected_seq = 0;
 
@@ -790,6 +796,7 @@ namespace stream {
   static auto broadcast = safe::make_shared<broadcast_ctx_t>(start_broadcast, end_broadcast);
 
   bool ensure_mic_sock_open(broadcast_ctx_t &ctx);
+  bool start_mic_receiver(broadcast_ctx_t &ctx);
   void mic_session_acquire(broadcast_ctx_t &ctx);
   void mic_session_release(broadcast_ctx_t &ctx);
   int mic_session_start(session_t &session);
@@ -2897,8 +2904,6 @@ namespace stream {
     }
 
     session_t *mic_find_session(broadcast_ctx_t &ctx, const udp::endpoint &peer) {
-      auto lg = ctx.control_server._sessions.lock();
-      session_t *fallback = nullptr;
       for (auto *session : *ctx.control_server._sessions) {
         if (!session || !session->mic.enabled) {
           continue;
@@ -2921,19 +2926,11 @@ namespace stream {
             return session;
           }
         }
-        if (!fallback) {
-          fallback = session;
-        }
       }
-      return fallback;
+      return nullptr;
     }
 
     void mic_on_packet(broadcast_ctx_t &ctx, const udp::endpoint &peer, const std::uint8_t *data, std::size_t bytes) {
-      auto *session = mic_find_session(ctx, peer);
-      if (!session) {
-        return;
-      }
-
       bool is_fec = false;
       std::uint16_t seq = 0;
       const std::uint8_t *payload = nullptr;
@@ -2942,6 +2939,14 @@ namespace stream {
       std::size_t fec_len = 0;
 
       if (!mic_parse_packet(data, bytes, is_fec, seq, payload, payload_len, fec_base, fec_len)) {
+        return;
+      }
+
+      // Keep the session alive in the control server's raw-pointer list while
+      // the packet is decoded and queued.
+      auto sessions = ctx.control_server._sessions.lock();
+      auto *session = mic_find_session(ctx, peer);
+      if (!session) {
         return;
       }
 
@@ -3005,6 +3010,21 @@ namespace stream {
     return true;
   }
 
+  bool start_mic_receiver(broadcast_ctx_t &ctx) {
+    std::lock_guard lg {ctx.mic_start_mutex};
+    if (ctx.mic_thread.joinable()) {
+      return true;
+    }
+    if (!ensure_mic_sock_open(ctx)) {
+      return false;
+    }
+    if (ctx.mic_io_context.stopped()) {
+      ctx.mic_io_context.restart();
+    }
+    ctx.mic_thread = std::thread {micRecvThread, std::ref(ctx)};
+    return true;
+  }
+
   void mic_session_acquire(broadcast_ctx_t &ctx) {
     ctx.mic_sessions_count.fetch_add(1, std::memory_order_acq_rel);
   }
@@ -3022,6 +3042,12 @@ namespace stream {
     }
     if (!config::audio.stream_mic) {
       BOOST_LOG(warning) << "[mic] session requested mic but stream_mic is disabled"sv;
+      session.mic.enabled = false;
+      return -1;
+    }
+
+    if (!session.broadcast_ref || !start_mic_receiver(*session.broadcast_ref.get())) {
+      BOOST_LOG(warning) << "[mic] failed to start UDP receiver"sv;
       session.mic.enabled = false;
       return -1;
     }
@@ -3075,7 +3101,6 @@ namespace stream {
     session.mic.rs_recovered = 0;
 
     if (session.broadcast_ref) {
-      ensure_mic_sock_open(*session.broadcast_ref.get());
       mic_session_acquire(*session.broadcast_ref.get());
     }
 
@@ -3160,7 +3185,6 @@ namespace stream {
         return;
       }
 
-      ctx.mic_recv_count.fetch_add(1, std::memory_order_relaxed);
       mic_on_packet(ctx, peer, reinterpret_cast<const std::uint8_t *>(buf.data()), bytes);
     };
 
@@ -3264,20 +3288,6 @@ namespace stream {
     ctx.control_thread = std::thread {controlBroadcastThread, &ctx.control_server};
 
     ctx.recv_thread = std::thread {recvThread, std::ref(ctx)};
-
-    if (config::audio.stream_mic) {
-      if (ensure_mic_sock_open(ctx)) {
-        ctx.mic_socket_enabled.store(true, std::memory_order_release);
-        if (ctx.mic_io_context.stopped()) {
-          ctx.mic_io_context.restart();
-        }
-        if (!ctx.mic_thread.joinable()) {
-          ctx.mic_thread = std::thread {micRecvThread, std::ref(ctx)};
-        }
-      } else {
-        BOOST_LOG(warning) << "[mic] socket not started — uplink unavailable this broadcast"sv;
-      }
-    }
 
     return 0;
   }
@@ -3979,11 +3989,7 @@ namespace stream {
     if (!config::audio.stream_mic) {
       return false;
     }
-    if (auto ref = audio::get_audio_ctx_ref(); ref && ref->control) {
-      return ref->control->mic_redirect_available();
-    }
-    auto control = platf::audio_control();
-    return control && control->mic_redirect_available();
+    return platf::mic_redirect_available();
 #else
     return false;
 #endif
@@ -3998,16 +4004,6 @@ namespace stream {
     }
     status.ready = mic_backend_ready();
     status.port = net::map_port(MIC_STREAM_PORT);
-    status.session_active = false;
-    if (auto ref = broadcast.ref()) {
-      auto lg = ref->control_server._sessions.lock();
-      for (auto *s : *ref->control_server._sessions) {
-        if (s && s->mic.enabled) {
-          status.session_active = true;
-          break;
-        }
-      }
-    }
 #else
     status.capable = false;
 #endif

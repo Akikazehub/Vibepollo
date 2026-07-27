@@ -1650,20 +1650,14 @@ namespace platf::audio {
     }
 
     bool mic_redirect_available() override {
-      // Cheap presence check: try init then release if we only wanted a probe.
       if (mic_redirect_device) {
         return true;
       }
-      auto device = std::make_unique<vibepollo_vmic_t>();
-      if (device->init() != 0) {
-        return false;
-      }
-      // Keep it warm if stream_mic is on; otherwise release.
-      if (config::audio.stream_mic) {
-        mic_redirect_device = std::move(device);
+
+      if (!config::audio.mic_sink.empty() && is_sink_available(config::audio.mic_sink)) {
         return true;
       }
-      return true;
+      return is_sink_available("Steam Streaming Microphone");
     }
 
     platf::capture_snapshot_t snapshot_capture_defaults() override {
@@ -1803,6 +1797,11 @@ namespace platf {
     }
 
     return control;
+  }
+
+  bool mic_redirect_available() {
+    auto control = std::make_unique<audio::audio_control_t>();
+    return control->init() == 0 && control->mic_redirect_available();
   }
 
   std::unique_ptr<deinit_t> init() {

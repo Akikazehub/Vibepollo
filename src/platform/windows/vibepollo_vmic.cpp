@@ -23,9 +23,6 @@ namespace platf::audio {
     std::vector<std::wstring> patterns;
     if (!config::audio.mic_sink.empty()) {
       patterns.push_back(platf::from_utf8(config::audio.mic_sink));
-      backend->requested_device_name = config::audio.mic_sink;
-    } else {
-      backend->requested_device_name = "Steam Streaming Microphone";
     }
     // Always include the canonical fallback names so the backend can
     // auto-discover the device even when mic_sink uses a shorter alias.

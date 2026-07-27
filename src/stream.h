@@ -82,12 +82,11 @@ namespace stream {
   struct mic_status_t {
     bool capable = false;  ///< Feature built/enabled in config
     bool ready = false;  ///< Steam Streaming Microphone endpoint present
-    bool session_active = false;  ///< At least one session requested mic
     std::uint16_t port = 0;  ///< Mapped MIC_STREAM_PORT (0 if disabled)
   };
 
   /**
-   * @brief Probe whether the Steam mic backend can be initialized (lightweight).
+   * @brief Check whether the Steam mic endpoint is currently available.
    */
   bool mic_backend_ready();
 

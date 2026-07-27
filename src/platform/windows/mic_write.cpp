@@ -441,25 +441,9 @@ namespace platf::audio {
     }
     platf::adjust_thread_priority(platf::thread_priority_e::high);
 
-    static constexpr std::size_t kPrebufFrames = 960 * 2;  // 2 Opus packets — matches mic_buffer_packets default
-
     while (!stop_render_thread.load(std::memory_order_acquire)) {
       WaitForSingleObject(render_event.get(), 20);
       if (stop_render_thread.load(std::memory_order_acquire)) break;
-
-      if (!playout_started) {
-        std::size_t qsz;
-        { std::lock_guard<std::mutex> lk(queue_mutex); qsz = pending_frames.size(); }
-        if (qsz < kPrebufFrames) {
-          if (!playout_wait_logged) {
-            playout_wait_logged = true;
-            BOOST_LOG(info) << "[mic] Steam mic: waiting for prebuffer..."sv;
-          }
-          continue;
-        }
-        playout_started = true;
-        BOOST_LOG(info) << "[mic] Steam mic playout started (prebuffer: "sv << qsz << " frames)"sv;
-      }
 
       UINT32 padding = 0;
       HRESULT pad_hr = audio_client->GetCurrentPadding(&padding);
@@ -471,8 +455,6 @@ namespace platf::audio {
         if (audio_client) audio_client->Stop();
         if (audio_render) { audio_render->Release(); audio_render = nullptr; }
         audio_client.reset();
-        playout_started = false;
-        playout_wait_logged = false;
         // Re-find device and re-initialize
         std::wstring device_id;
         if (!find_target_device(device_id) || !initialize_device(device_id)) {

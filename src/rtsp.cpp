@@ -1295,8 +1295,8 @@ namespace rtsp_stream {
 
     // Advertise mic encryption when mic uplink can be offered to this client.
     const auto mic_status = stream::get_mic_status();
-    const bool advertise_mic = config::audio.stream_mic &&
-                               (config::audio.mic_require_steam ? mic_status.ready : mic_status.capable);
+    const bool advertise_mic = mic_status.capable &&
+                               (!config::audio.mic_require_steam || mic_status.ready);
     if (mic_status.capable) {
       encryption_flags_supported |= SS_ENC_MIC;
     }
@@ -1390,12 +1390,13 @@ namespace rtsp_stream {
     } else if (type == "mic"sv) {
       // Accept SETUP even when the Steam backend is temporarily missing so Foundation
       // clients can complete handshake; the stream path no-ops without a sink.
-      if (!config::audio.stream_mic) {
-        BOOST_LOG(warning) << "Rejecting mic SETUP: stream_mic is disabled"sv;
+      const auto mic_status = stream::get_mic_status();
+      if (!mic_status.capable) {
+        BOOST_LOG(warning) << "Rejecting mic SETUP: microphone uplink is unavailable"sv;
         cmd_not_found(server, socket, session, std::move(req));
         return false;
       }
-      if (config::audio.mic_require_steam && !stream::mic_backend_ready()) {
+      if (config::audio.mic_require_steam && !mic_status.ready) {
         BOOST_LOG(warning) << "Mic SETUP accepted but Steam Streaming Microphone is not ready"sv;
       }
       session->enable_mic = true;

@@ -65,7 +65,6 @@ namespace platf::audio {
 
     // Set before calling init()
     std::vector<std::wstring> autodetect_patterns;
-    std::string requested_device_name;
 
   private:
     bool find_target_device(std::wstring &out_device_id);
@@ -78,7 +77,6 @@ namespace platf::audio {
     util::safe_ptr<IAudioClient, release_com<IAudioClient>> audio_client;
     IAudioRenderClient *audio_render = nullptr;
     UINT32 buffer_frame_count = 0;
-    std::string backend_name;
     std::string target_device_name;
     bool first_packet_written_logged = false;
     bool render_dead_logged = false;
@@ -88,8 +86,6 @@ namespace platf::audio {
     std::thread render_thread;
     std::atomic<bool> stop_render_thread {false};
     std::atomic<bool> render_dead {false};
-    bool playout_started = false;
-    bool playout_wait_logged = false;
   };
 
 }  // namespace platf::audio
