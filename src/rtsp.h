@@ -37,6 +37,8 @@ namespace stream {
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;
+  constexpr std::uint8_t MIC_PROTOCOL_FOUNDATION_LEGACY = 0;
+  constexpr std::uint8_t MIC_PROTOCOL_MOONLIGHT_V1 = 1;
 
   struct launch_session_t {
     uint32_t id;
@@ -77,6 +79,8 @@ namespace rtsp_stream {
     bool continuous_audio;
     /// Client requested microphone uplink via RTSP SETUP type "mic".
     bool enable_mic = false;
+    /// Locked microphone wire protocol selected by RTSP SETUP (0=Foundation legacy, 1=moonlight-mic/1).
+    std::uint8_t mic_protocol_version = MIC_PROTOCOL_FOUNDATION_LEGACY;
     bool enable_hdr;
     // Resolved global/per-client preference for Main10 SDR when the client requests SDR.
     bool prefer_sdr_10bit = false;

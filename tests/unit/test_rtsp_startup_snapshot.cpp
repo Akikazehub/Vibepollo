@@ -43,6 +43,7 @@ namespace {
     ls.lossless_scaling_target_fps = 144.0;
     ls.lossless_scaling_rtss_limit = 90;
     ls.enable_mic = true;
+    ls.mic_protocol_version = rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1;
 
     return ls;
   }
@@ -96,6 +97,7 @@ TEST(RtspStartupSnapshot, CopiesAllConsumedFields) {
   EXPECT_EQ(clone->lossless_scaling_target_fps, source.lossless_scaling_target_fps);
   EXPECT_EQ(clone->lossless_scaling_rtss_limit, source.lossless_scaling_rtss_limit);
   EXPECT_EQ(clone->enable_mic, source.enable_mic);
+  EXPECT_EQ(clone->mic_protocol_version, source.mic_protocol_version);
 
   // The clone intentionally does NOT copy rtsp_cipher: it is move-only and only the
   // io_context respond() path uses it, never the startup worker.

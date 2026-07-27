@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
@@ -571,10 +572,44 @@ namespace stream {
     control_server_t control_server;
   };
 
-  struct mic_seq_order_t {
-    bool operator()(std::uint16_t left, std::uint16_t right) const {
-      return static_cast<std::int16_t>(left - right) < 0;
+  struct mic_rs_block_key_t {
+    std::uint32_t ssrc = 0;
+    std::uint16_t base_seq = 0;
+
+    bool operator<(const mic_rs_block_key_t &other) const {
+      return ssrc < other.ssrc || (ssrc == other.ssrc && base_seq < other.base_seq);
     }
+  };
+
+  struct mic_rs_block_t {
+    std::array<std::vector<std::uint8_t>, RTPA_DATA_SHARDS> data;
+    std::array<std::vector<std::uint8_t>, RTPA_FEC_SHARDS> fec;
+    std::array<std::uint16_t, RTPA_FEC_SHARDS> fec_sequences {};
+    std::array<std::uint8_t, RTPA_TOTAL_SHARDS> marks {};
+    std::array<std::uint16_t, RTPA_DATA_SHARDS> payload_lengths {};
+    std::uint32_t data_ssrc = 0;
+    std::uint32_t base_timestamp = 0;
+    std::uint16_t base_seq = 0;
+    std::size_t block_size = 0;
+    int data_count = 0;
+    int fec_count = 0;
+    bool has_fec_metadata = false;
+    std::chrono::steady_clock::time_point updated_at;
+  };
+
+  struct mic_recent_data_key_t {
+    std::uint32_t ssrc = 0;
+    std::uint16_t sequence = 0;
+
+    bool operator<(const mic_recent_data_key_t &other) const {
+      return ssrc < other.ssrc || (ssrc == other.ssrc && sequence < other.sequence);
+    }
+  };
+
+  struct mic_recent_data_t {
+    std::vector<std::uint8_t> wire_payload;
+    std::uint32_t timestamp = 0;
+    std::chrono::steady_clock::time_point updated_at;
   };
 
   struct session_t {
@@ -674,7 +709,7 @@ namespace stream {
     // Microphone uplink (client → host via MIC_STREAM_PORT)
     struct {
       bool enabled = false;  ///< Session requested mic (RTSP SETUP mic)
-      bool rs_fec_enabled = false;  ///< Client negotiated/using RS-FEC extension
+      std::uint8_t protocol_version = rtsp_stream::MIC_PROTOCOL_FOUNDATION_LEGACY;
       bool capture_switched = false;
       platf::capture_snapshot_t capture_snap {};
       // Keep the shared audio context alive so the Steam mic backend outlives this session.
@@ -687,21 +722,15 @@ namespace stream {
         std::vector<std::uint8_t> opus;
         std::uint16_t seq = 0;
       };
-      std::map<std::uint16_t, queued_t, mic_seq_order_t> pending;
+      std::map<std::uint16_t, queued_t> pending;
       bool has_playout_cursor = false;
       std::uint16_t expected_seq = 0;
+      std::uint32_t data_ssrc = 0;
+      std::uint32_t parity_ssrc = 0;
 
-      // Optional RS-FEC assembly (extension path)
-      struct rs_block_t {
-        std::array<std::vector<std::uint8_t>, RTPA_DATA_SHARDS> data;
-        std::array<std::vector<std::uint8_t>, RTPA_FEC_SHARDS> fec;
-        std::array<uint8_t, RTPA_TOTAL_SHARDS> marks {};
-        std::uint16_t base_seq = 0;
-        int block_size = 0;
-        int data_count = 0;
-        int fec_count = 0;
-      };
-      std::unique_ptr<rs_block_t> rs_block;
+      // moonlight-mic/1 keeps a small block window for data/parity reordering.
+      std::map<mic_rs_block_key_t, mic_rs_block_t> rs_blocks;
+      std::map<mic_recent_data_key_t, mic_recent_data_t> recent_data;
       std::unique_ptr<reed_solomon, void (*)(reed_solomon *)> rs {nullptr, reed_solomon_release};
 
       std::uint64_t packets_received = 0;
@@ -2585,19 +2614,61 @@ namespace stream {
       }
     }
 
+    std::optional<int> mic_v1_block_index(std::uint16_t base_sequence, std::uint16_t sequence) {
+      const auto offset = (std::uint16_t) (sequence - base_sequence);
+      if (offset >= RTPA_DATA_SHARDS) {
+        return std::nullopt;
+      }
+      return (int) offset;
+    }
+
+    bool mic_waiting_for_v1_fec(const session_t &session, std::uint16_t seq) {
+      if (session.mic.protocol_version != rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1) {
+        return false;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      for (const auto &[key, block] : session.mic.rs_blocks) {
+        const auto index = mic_v1_block_index(key.base_seq, seq);
+        if (block.has_fec_metadata && index && block.marks[*index] != 0 &&
+            now - block.updated_at <= std::chrono::milliseconds(RTPQ_OOS_WAIT_TIME_MS)) {
+          return true;
+        }
+      }
+
+      // Before parity arrives there is no authoritative block base. A nearby
+      // later data packet is enough to defer PLC briefly without inventing one.
+      for (const auto &[key, recent] : session.mic.recent_data) {
+        const auto distance = (std::uint16_t) (key.sequence - seq);
+        if (distance > 0 && distance < RTPA_DATA_SHARDS &&
+            now - recent.updated_at <= std::chrono::milliseconds(RTPQ_OOS_WAIT_TIME_MS)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     void mic_queue_opus(session_t &session, std::uint16_t seq, std::vector<std::uint8_t> &&opus) {
       auto &mic = session.mic;
-      const int prebuffer = std::clamp(config::audio.mic_buffer_packets, 1, 16);
+      const int configured_prebuffer = std::clamp(config::audio.mic_buffer_packets, 1, 16);
+      int prebuffer = configured_prebuffer;
+      if (mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1) {
+        prebuffer = std::max(prebuffer, RTPA_DATA_SHARDS);
+      }
 
       if (!mic.has_playout_cursor) {
+        if (mic.pending.empty()) {
+          mic.expected_seq = seq;
+        } else {
+          const auto delta = (std::int16_t) (seq - mic.expected_seq);
+          if (delta < 0 && delta >= -16) {
+            mic.expected_seq = seq;
+          }
+        }
         mic.pending[seq] = decltype(mic.pending)::mapped_type {std::move(opus), seq};
-        // Use the lowest seq currently buffered as the start once we have enough packets,
-        // so late first packets don't pin the cursor forever.
         if ((int) mic.pending.size() >= prebuffer) {
-          mic.expected_seq = mic.pending.begin()->first;
           mic.has_playout_cursor = true;
         } else if (mic.pending.size() >= kMicMaxQueued) {
-          mic.expected_seq = mic.pending.begin()->first;
           mic.has_playout_cursor = true;
         } else {
           return;
@@ -2612,18 +2683,14 @@ namespace stream {
       }
 
       while (mic.pending.size() > kMicMaxQueued) {
-        // Prefer dropping the oldest relative to the cursor.
-        auto it = mic.pending.begin();
-        if (it->first == mic.expected_seq) {
+        auto farthest = std::max_element(mic.pending.begin(), mic.pending.end(), [&](const auto &left, const auto &right) {
+          return (std::uint16_t) (left.first - mic.expected_seq) <
+                 (std::uint16_t) (right.first - mic.expected_seq);
+        });
+        if (farthest == mic.pending.end() || farthest->first == mic.expected_seq) {
           break;
         }
-        // If the map's first key is not expected (wrap/gap), erase farthest ahead.
-        auto last = std::prev(mic.pending.end());
-        if (last->first != mic.expected_seq) {
-          mic.pending.erase(last);
-        } else {
-          mic.pending.erase(it);
-        }
+        mic.pending.erase(farthest);
       }
 
       // Contiguous playout; limited PLC via Opus null-packet on small gaps.
@@ -2643,12 +2710,18 @@ namespace stream {
         }
 
         // If we already have later packets, fill a short gap with PLC then continue.
-        const auto next = mic.pending.begin()->first;
-        const std::int16_t gap = (std::int16_t) (next - mic.expected_seq);
-        if (gap <= 0) {
-          // Stale/duplicate relative ordering — drop and resync.
-          mic.pending.erase(mic.pending.begin());
+        auto next_it = std::min_element(mic.pending.begin(), mic.pending.end(), [&](const auto &left, const auto &right) {
+          return (std::uint16_t) (left.first - mic.expected_seq) <
+                 (std::uint16_t) (right.first - mic.expected_seq);
+        });
+        const auto next = next_it->first;
+        const auto gap = (std::uint16_t) (next - mic.expected_seq);
+        if (gap >= 0x8000) {
+          mic.pending.erase(next_it);
           continue;
+        }
+        if (mic_waiting_for_v1_fec(session, mic.expected_seq)) {
+          break;
         }
         if (gap > 8 || missing_skipped >= 4) {
           // Large loss: jump forward rather than synthesizing a long stretch.
@@ -2663,29 +2736,103 @@ namespace stream {
       }
     }
 
-    void mic_rs_reset_block(session_t &session, std::uint16_t base_seq, int block_size) {
-      auto block = std::make_unique<std::remove_reference_t<decltype(*session.mic.rs_block)>>();
-      block->base_seq = base_seq;
-      block->block_size = block_size;
-      block->marks.fill(1);
-      session.mic.rs_block = std::move(block);
-
+    bool mic_ensure_rs(session_t &session) {
       if (!session.mic.rs) {
         session.mic.rs.reset(reed_solomon_new(RTPA_DATA_SHARDS, RTPA_FEC_SHARDS));
         if (session.mic.rs) {
-          // Match downlink audio parity matrix (OpenFEC / NVIDIA compatible).
+          // Fixed OpenFEC/NVIDIA matrix used by moonlight-mic/1.
           const unsigned char parity[] = {0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c};
           std::memcpy(session.mic.rs->p, parity, sizeof(parity));
         }
       }
+      return session.mic.rs != nullptr;
     }
 
-    void mic_rs_try_recover(session_t &session) {
+    mic_rs_block_t &mic_get_rs_block(session_t &session, std::uint32_t data_ssrc, std::uint16_t base_seq) {
+      auto &blocks = session.mic.rs_blocks;
+      const mic_rs_block_key_t key {data_ssrc, base_seq};
+      auto [it, inserted] = blocks.try_emplace(key);
+      if (inserted) {
+        it->second.data_ssrc = data_ssrc;
+        it->second.base_seq = base_seq;
+        it->second.marks.fill(1);
+      }
+      it->second.updated_at = std::chrono::steady_clock::now();
+
+      if (inserted && blocks.size() > RTPA_CACHED_FEC_BLOCK_LIMIT) {
+        auto oldest = blocks.end();
+        for (auto candidate = blocks.begin(); candidate != blocks.end(); ++candidate) {
+          if (candidate != it && (oldest == blocks.end() || candidate->second.updated_at < oldest->second.updated_at)) {
+            oldest = candidate;
+          }
+        }
+        if (oldest != blocks.end()) {
+          blocks.erase(oldest);
+        }
+      }
+
+      return it->second;
+    }
+
+    bool mic_store_recent_v1_data(
+      session_t &session,
+      std::uint32_t data_ssrc,
+      std::uint16_t sequence,
+      std::uint32_t timestamp,
+      const std::vector<std::uint8_t> &wire_payload
+    ) {
+      constexpr std::size_t kRecentDataLimit = RTPA_CACHED_FEC_BLOCK_LIMIT * RTPA_DATA_SHARDS;
+      auto &recent_data = session.mic.recent_data;
+      const mic_recent_data_key_t key {data_ssrc, sequence};
+      auto [it, inserted] = recent_data.try_emplace(key);
+      if (!inserted) {
+        return false;
+      }
+
+      it->second.wire_payload = wire_payload;
+      it->second.timestamp = timestamp;
+      it->second.updated_at = std::chrono::steady_clock::now();
+      if (recent_data.size() > kRecentDataLimit) {
+        auto oldest = recent_data.end();
+        for (auto candidate = recent_data.begin(); candidate != recent_data.end(); ++candidate) {
+          if (candidate != it && (oldest == recent_data.end() || candidate->second.updated_at < oldest->second.updated_at)) {
+            oldest = candidate;
+          }
+        }
+        if (oldest != recent_data.end()) {
+          recent_data.erase(oldest);
+        }
+      }
+      return true;
+    }
+
+    bool mic_v1_data_matches_block(
+      const mic_rs_block_t &block,
+      int index,
+      std::uint32_t timestamp,
+      const std::vector<std::uint8_t> &wire_payload
+    ) {
+      return block.has_fec_metadata &&
+             wire_payload.size() == block.payload_lengths[index] &&
+             (index != 0 || timestamp == block.base_timestamp);
+    }
+
+    void mic_attach_v1_data_to_block(
+      mic_rs_block_t &block,
+      int index,
+      const std::vector<std::uint8_t> &wire_payload
+    ) {
+      block.data[index] = wire_payload;
+      block.marks[index] = 0;
+      ++block.data_count;
+      block.updated_at = std::chrono::steady_clock::now();
+    }
+
+    void mic_rs_try_recover(session_t &session, mic_rs_block_t &block) {
       auto &mic = session.mic;
-      if (!mic.rs_block || !mic.rs || mic.rs_block->block_size <= 0) {
+      if (!block.has_fec_metadata || block.block_size == 0 || !mic_ensure_rs(session)) {
         return;
       }
-      auto &block = *mic.rs_block;
       if (block.data_count + block.fec_count < RTPA_DATA_SHARDS) {
         return;
       }
@@ -2699,22 +2846,26 @@ namespace stream {
       for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
         storage[i].assign(block.block_size, 0);
         if (!block.data[i].empty()) {
-          const auto n = std::min(block.data[i].size(), (std::size_t) block.block_size);
-          std::memcpy(storage[i].data(), block.data[i].data(), n);
+          if (block.data[i].size() > block.block_size) {
+            return;
+          }
+          std::memcpy(storage[i].data(), block.data[i].data(), block.data[i].size());
         }
         shards_p[i] = storage[i].data();
       }
       for (int i = 0; i < RTPA_FEC_SHARDS; ++i) {
         storage[RTPA_DATA_SHARDS + i].assign(block.block_size, 0);
         if (!block.fec[i].empty()) {
-          const auto n = std::min(block.fec[i].size(), (std::size_t) block.block_size);
-          std::memcpy(storage[RTPA_DATA_SHARDS + i].data(), block.fec[i].data(), n);
+          if (block.fec[i].size() != block.block_size) {
+            return;
+          }
+          std::memcpy(storage[RTPA_DATA_SHARDS + i].data(), block.fec[i].data(), block.fec[i].size());
         }
         shards_p[RTPA_DATA_SHARDS + i] = storage[RTPA_DATA_SHARDS + i].data();
       }
 
       auto marks = block.marks;
-      if (reed_solomon_decode(mic.rs.get(), shards_p.data(), marks.data(), RTPA_TOTAL_SHARDS, block.block_size) != 0) {
+      if (reed_solomon_decode(mic.rs.get(), shards_p.data(), marks.data(), RTPA_TOTAL_SHARDS, (int) block.block_size) != 0) {
         return;
       }
 
@@ -2722,185 +2873,368 @@ namespace stream {
         if (block.marks[i] == 0) {
           continue;  // already present
         }
-        // Recovered shard.
-        std::vector<std::uint8_t> recovered(shards_p[i], shards_p[i] + block.block_size);
-        // Trim PKCS7-ish trailing zeros cautiously: keep raw; decrypt path handles padding.
-        // For plaintext Opus the shard may be padded to block_size — strip trailing zeros only
-        // if encryption is off (Opus packets are self-delimiting via TOCsize but zero pad is common).
-        if (!(session.config.encryptionFlagsEnabled & SS_ENC_MIC)) {
-          while (recovered.size() > 1 && recovered.back() == 0) {
-            recovered.pop_back();
-          }
+        const auto payload_length = block.payload_lengths[i];
+        if (payload_length == 0 || payload_length > block.block_size) {
+          return;
         }
-        if (decrypt_mic_payload(session, (std::uint16_t) (block.base_seq + i), recovered) != 0) {
+
+        std::vector<std::uint8_t> recovered_wire_payload(shards_p[i], shards_p[i] + payload_length);
+        auto opus = recovered_wire_payload;
+        if (decrypt_mic_payload(session, (std::uint16_t) (block.base_seq + i), opus) != 0) {
+          BOOST_LOG(verbose) << "[mic] decrypt failed for recovered seq="sv << (std::uint16_t) (block.base_seq + i);
           continue;
         }
-        ++mic.rs_recovered;
-        mic_queue_opus(session, (std::uint16_t) (block.base_seq + i), std::move(recovered));
+
+        block.data[i] = std::move(recovered_wire_payload);
         block.marks[i] = 0;
         ++block.data_count;
+        ++mic.rs_recovered;
+        mic_queue_opus(session, (std::uint16_t) (block.base_seq + i), std::move(opus));
       }
     }
 
-    void mic_handle_fec_shard(session_t &session, const std::uint8_t *data, std::size_t bytes) {
-      if (bytes < sizeof(audio_fec_packet_t)) {
+    void mic_handle_v1_fec_shard(
+      session_t &session,
+      std::uint32_t parity_ssrc,
+      std::uint16_t parity_sequence,
+      std::uint32_t data_ssrc,
+      std::uint16_t base_seq,
+      std::uint32_t base_timestamp,
+      std::uint8_t shard_index,
+      const std::array<std::uint16_t, RTPA_DATA_SHARDS> &payload_lengths,
+      std::vector<std::uint8_t> &&parity
+    ) {
+      if (parity_ssrc == data_ssrc ||
+          (session.mic.data_ssrc != 0 && session.mic.data_ssrc != data_ssrc) ||
+          (session.mic.parity_ssrc != 0 && session.mic.parity_ssrc != parity_ssrc)) {
         return;
       }
-
-      session.mic.rs_fec_enabled = true;
-
-      const auto *fec_packet = reinterpret_cast<const audio_fec_packet_t *>(data);
-      const auto shard_index = fec_packet->fecHeader.fecShardIndex;
-      if (shard_index >= RTPA_FEC_SHARDS) {
-        return;
+      if (session.mic.parity_ssrc == 0) {
+        session.mic.parity_ssrc = parity_ssrc;
+      }
+      if (session.mic.data_ssrc == 0) {
+        session.mic.data_ssrc = data_ssrc;
       }
 
-      // FEC headers mirror downlink: base sequence is big-endian on the wire for FEC header
-      // (same as audioBroadcastThread). RTP sequence itself may still be LE on Foundation.
-      const std::uint16_t base_seq = util::endian::big(fec_packet->fecHeader.baseSequenceNumber);
-      const auto *payload = data + sizeof(audio_fec_packet_t);
-      const auto payload_len = bytes - sizeof(audio_fec_packet_t);
-      if (payload_len == 0) {
-        return;
+      auto &block = mic_get_rs_block(session, data_ssrc, base_seq);
+
+      if (block.has_fec_metadata) {
+        if (block.base_timestamp != base_timestamp || block.block_size != parity.size() ||
+            block.payload_lengths != payload_lengths) {
+          return;
+        }
+      } else {
+        for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
+          const mic_recent_data_key_t key {data_ssrc, (std::uint16_t) (base_seq + i)};
+          const auto recent = session.mic.recent_data.find(key);
+          if (recent != session.mic.recent_data.end() &&
+              (recent->second.wire_payload.size() != payload_lengths[i] ||
+               (i == 0 && recent->second.timestamp != base_timestamp))) {
+            return;
+          }
+        }
+        block.base_timestamp = base_timestamp;
+        block.block_size = parity.size();
+        block.payload_lengths = payload_lengths;
+        block.has_fec_metadata = true;
+
+        for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
+          const mic_recent_data_key_t key {data_ssrc, (std::uint16_t) (base_seq + i)};
+          const auto recent = session.mic.recent_data.find(key);
+          if (recent != session.mic.recent_data.end() && block.marks[i] != 0) {
+            mic_attach_v1_data_to_block(block, i, recent->second.wire_payload);
+          }
+        }
       }
 
-      if (!session.mic.rs_block || session.mic.rs_block->base_seq != base_seq ||
-          session.mic.rs_block->block_size != (int) payload_len) {
-        mic_rs_reset_block(session, base_seq, (int) payload_len);
-      }
-
-      auto &block = *session.mic.rs_block;
       if (block.marks[RTPA_DATA_SHARDS + shard_index] == 0) {
-        return;  // duplicate
+        return;
       }
-      block.fec[shard_index].assign(payload, payload + payload_len);
+      for (int i = 0; i < RTPA_FEC_SHARDS; ++i) {
+        if (i != shard_index && block.marks[RTPA_DATA_SHARDS + i] == 0 &&
+            block.fec_sequences[i] == parity_sequence) {
+          return;
+        }
+      }
+
+      block.fec[shard_index] = std::move(parity);
+      block.fec_sequences[shard_index] = parity_sequence;
       block.marks[RTPA_DATA_SHARDS + shard_index] = 0;
       ++block.fec_count;
-      mic_rs_try_recover(session);
+      mic_rs_try_recover(session, block);
     }
 
-    void mic_handle_data_shard(session_t &session, std::uint16_t seq, std::vector<std::uint8_t> &&payload) {
-      if (payload.empty()) {
+    void mic_handle_v1_data_shard(
+      session_t &session,
+      std::uint16_t seq,
+      std::uint32_t timestamp,
+      std::uint32_t data_ssrc,
+      std::vector<std::uint8_t> &&wire_payload
+    ) {
+      if ((session.mic.data_ssrc != 0 && session.mic.data_ssrc != data_ssrc) ||
+          session.mic.parity_ssrc == data_ssrc) {
         return;
       }
-      if (decrypt_mic_payload(session, seq, payload) != 0) {
+      if (session.mic.data_ssrc == 0) {
+        session.mic.data_ssrc = data_ssrc;
+      }
+
+      mic_rs_block_t *matching_block = nullptr;
+      int matching_index = 0;
+      for (auto &[key, block] : session.mic.rs_blocks) {
+        if (key.ssrc != data_ssrc || !block.has_fec_metadata) {
+          continue;
+        }
+        const auto index = mic_v1_block_index(key.base_seq, seq);
+        if (!index) {
+          continue;
+        }
+        if (matching_block) {
+          return;  // Reject ambiguous overlapping FEC metadata.
+        }
+        matching_block = &block;
+        matching_index = *index;
+      }
+
+      if (matching_block &&
+          (matching_block->marks[matching_index] == 0 ||
+           !mic_v1_data_matches_block(*matching_block, matching_index, timestamp, wire_payload))) {
+        return;
+      }
+
+      auto opus = wire_payload;
+      if (decrypt_mic_payload(session, seq, opus) != 0) {
         BOOST_LOG(verbose) << "[mic] decrypt failed seq="sv << seq;
         return;
       }
 
-      // Opportunistic RS: also feed data shards into the current block when enabled.
-      if (session.mic.rs_fec_enabled) {
-        const std::uint16_t base = (std::uint16_t) (seq & ~(RTPA_DATA_SHARDS - 1));
-        const int index = seq % RTPA_DATA_SHARDS;
-        if (!session.mic.rs_block || session.mic.rs_block->base_seq != base) {
-          // Don't force a block size from data alone if FEC hasn't set it yet; use payload size.
-          mic_rs_reset_block(session, base, (int) payload.size());
-        }
-        auto &block = *session.mic.rs_block;
-        if (block.block_size <= 0) {
-          block.block_size = (int) payload.size();
-        }
-        if (block.marks[index] != 0) {
-          block.data[index] = payload;  // copy before move into jitter path
-          block.marks[index] = 0;
-          ++block.data_count;
-          mic_rs_try_recover(session);
-        }
+      if (!mic_store_recent_v1_data(session, data_ssrc, seq, timestamp, wire_payload)) {
+        return;
       }
 
+      // FEC protects the exact wire payload. Keep this copy encrypted while a
+      // second copy follows the normal decrypt/jitter path immediately.
+      if (matching_block) {
+        mic_attach_v1_data_to_block(*matching_block, matching_index, wire_payload);
+        mic_rs_try_recover(session, *matching_block);
+      }
+
+      mic_queue_opus(session, seq, std::move(opus));
+    }
+
+    void mic_handle_legacy_data(session_t &session, std::uint16_t seq, std::vector<std::uint8_t> &&payload) {
+      if (decrypt_mic_payload(session, seq, payload) != 0) {
+        BOOST_LOG(verbose) << "[mic] legacy decrypt failed seq="sv << seq;
+        return;
+      }
       mic_queue_opus(session, seq, std::move(payload));
     }
 
-    bool mic_parse_packet(
+    enum class mic_packet_kind_e : std::uint8_t {
+      data,
+      fec
+    };
+
+    struct normalized_mic_packet_t {
+      mic_packet_kind_e kind = mic_packet_kind_e::data;
+      std::uint16_t sequence = 0;
+      std::uint32_t timestamp = 0;
+      std::uint32_t ssrc = 0;
+      const std::uint8_t *payload = nullptr;
+      std::size_t payload_length = 0;
+
+      std::uint8_t fec_shard_index = 0;
+      std::uint16_t fec_base_sequence = 0;
+      std::uint32_t fec_base_timestamp = 0;
+      std::uint32_t fec_data_ssrc = 0;
+      std::array<std::uint16_t, RTPA_DATA_SHARDS> fec_payload_lengths {};
+    };
+
+    constexpr std::size_t kRtpFixedHeaderSize = 12;
+    constexpr std::size_t kAudioFecHeaderSize = 12;
+    constexpr std::size_t kMicFecV1ExtensionSize = 12;
+    constexpr std::uint8_t kMicFecEncryptedFlag = 0x01;
+
+    std::uint16_t mic_read_be16(const std::uint8_t *data) {
+      return (std::uint16_t) ((data[0] << 8) | data[1]);
+    }
+
+    std::uint32_t mic_read_be32(const std::uint8_t *data) {
+      return ((std::uint32_t) data[0] << 24) |
+             ((std::uint32_t) data[1] << 16) |
+             ((std::uint32_t) data[2] << 8) |
+             data[3];
+    }
+
+    bool mic_parse_v1_rtp_header(
       const std::uint8_t *data,
       std::size_t bytes,
-      bool &is_fec,
-      std::uint16_t &seq,
-      const std::uint8_t *&payload,
-      std::size_t &payload_len,
-      const std::uint8_t *&fec_base,
-      std::size_t &fec_len
+      normalized_mic_packet_t &packet,
+      std::uint8_t &payload_type,
+      std::size_t &header_length
     ) {
-      is_fec = false;
-      payload = nullptr;
-      payload_len = 0;
-      fec_base = nullptr;
-      fec_len = 0;
-      seq = 0;
-
-      if (!data || bytes < 4) {
+      if (!data || bytes < kRtpFixedHeaderSize || (data[0] & 0xc0) != 0x80 || (data[0] & 0x20) != 0 ||
+          (data[1] & 0x80) != 0) {
         return false;
       }
 
-      // Foundation extended header: BE type 0x5504, then LE seq, then opus.
-      const std::uint16_t type_be = (std::uint16_t) ((data[0] << 8) | data[1]);
-      if (type_be == IDX_MIC_DATA_TYPE) {
-        if (bytes < 4) {
+      header_length = kRtpFixedHeaderSize + (std::size_t) (data[0] & 0x0f) * 4;
+      if (header_length > bytes) {
+        return false;
+      }
+
+      if ((data[0] & 0x10) != 0) {
+        if (bytes - header_length < 4) {
           return false;
         }
-        seq = (std::uint16_t) (data[2] | (data[3] << 8));
-        // Some peers include a 2-byte length; if the next two bytes look like a length
-        // matching the remainder, skip them. Otherwise payload starts at offset 4.
-        std::size_t off = 4;
-        if (bytes >= 6) {
-          const std::uint16_t maybe_len = (std::uint16_t) ((data[4] << 8) | data[5]);
-          if (maybe_len == bytes - 6 || maybe_len == bytes - 4) {
-            off = 6;
-          }
-        }
-        // If the remainder still looks like a full RTP header, prefer that layout.
-        if (bytes >= off + sizeof(RTP_PACKET)) {
-          const auto *rtp = reinterpret_cast<const RTP_PACKET *>(data + off);
-          if (rtp->packetType == 96 || rtp->packetType == MIC_PACKET_TYPE_OPUS || rtp->packetType == 127) {
-            data += off;
-            bytes -= off;
-            // fall through to RTP parse below
-          } else {
-            payload = data + off;
-            payload_len = bytes - off;
-            return payload_len > 0;
-          }
-        } else {
-          payload = data + off;
-          payload_len = bytes - off;
-          return payload_len > 0;
-        }
-      }
-
-      if (bytes < sizeof(RTP_PACKET)) {
-        return false;
-      }
-
-      const auto *rtp = reinterpret_cast<const RTP_PACKET *>(data);
-      // Foundation clients write RTP sequence little-endian.
-      seq = (std::uint16_t) (data[2] | (data[3] << 8));
-      const auto pt = rtp->packetType;
-
-      std::size_t header_len = sizeof(RTP_PACKET);
-      // Skip RTP header extension when the X bit is set.
-      if ((rtp->header & 0x10) && bytes >= header_len + 4) {
-        const std::uint16_t ext_words = (std::uint16_t) ((data[header_len + 2] << 8) | data[header_len + 3]);
-        header_len += 4 + (std::size_t) ext_words * 4;
-        if (bytes < header_len) {
+        const auto extension_words = mic_read_be16(data + header_length + 2);
+        const auto extension_bytes = (std::size_t) extension_words * 4;
+        if (extension_bytes > bytes - header_length - 4) {
           return false;
         }
+        header_length += 4 + extension_bytes;
       }
 
-      if (pt == 127) {
-        is_fec = true;
-        fec_base = data;
-        fec_len = bytes;
-        return bytes >= sizeof(audio_fec_packet_t);
-      }
+      payload_type = data[1] & 0x7f;
+      packet.sequence = mic_read_be16(data + 2);
+      packet.timestamp = mic_read_be32(data + 4);
+      packet.ssrc = mic_read_be32(data + 8);
+      return packet.ssrc != 0;
+    }
 
-      if (pt != 96 && pt != MIC_PACKET_TYPE_OPUS && pt != 97) {
-        // Accept unknown PT only when the extended type path already matched above.
+    bool mic_parse_moonlight_v1(
+      const session_t &session,
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet
+    ) {
+      std::uint8_t payload_type = 0;
+      std::size_t header_length = 0;
+      if (!mic_parse_v1_rtp_header(data, bytes, packet, payload_type, header_length)) {
         return false;
       }
 
-      payload = data + header_len;
-      payload_len = bytes - header_len;
-      return payload_len > 0;
+      const auto *rtp_payload = data + header_length;
+      const auto rtp_payload_length = bytes - header_length;
+      if (payload_type == MIC_PACKET_TYPE_OPUS) {
+        if (rtp_payload_length == 0 || rtp_payload_length > MAX_AUDIO_PACKET_SIZE) {
+          return false;
+        }
+        packet.kind = mic_packet_kind_e::data;
+        packet.payload = rtp_payload;
+        packet.payload_length = rtp_payload_length;
+        return true;
+      }
+
+      if (payload_type != 127 || rtp_payload_length < kAudioFecHeaderSize + kMicFecV1ExtensionSize + 1) {
+        return false;
+      }
+
+      const auto *fec = rtp_payload;
+      const auto *extension = fec + kAudioFecHeaderSize;
+      const auto extension_length = mic_read_be16(extension + 2);
+      if (fec[0] >= RTPA_FEC_SHARDS || fec[1] != MIC_PACKET_TYPE_OPUS || extension[0] != 1 ||
+          extension_length != kMicFecV1ExtensionSize || (extension[1] & ~kMicFecEncryptedFlag) != 0) {
+        return false;
+      }
+
+      const bool protected_payload_encrypted = (extension[1] & kMicFecEncryptedFlag) != 0;
+      const bool session_encrypted = (session.config.encryptionFlagsEnabled & SS_ENC_MIC) != 0;
+      if (protected_payload_encrypted != session_encrypted) {
+        return false;
+      }
+
+      const auto fec_headers_length = kAudioFecHeaderSize + (std::size_t) extension_length;
+      if (fec_headers_length >= rtp_payload_length) {
+        return false;
+      }
+      const auto parity_length = rtp_payload_length - fec_headers_length;
+      if (parity_length == 0 || parity_length > MAX_AUDIO_PACKET_SIZE) {
+        return false;
+      }
+
+      packet.kind = mic_packet_kind_e::fec;
+      packet.fec_shard_index = fec[0];
+      packet.fec_base_sequence = mic_read_be16(fec + 2);
+      packet.fec_base_timestamp = mic_read_be32(fec + 4);
+      packet.fec_data_ssrc = mic_read_be32(fec + 8);
+      if (packet.fec_data_ssrc == 0) {
+        return false;
+      }
+
+      for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
+        const auto payload_length = mic_read_be16(extension + 4 + i * 2);
+        if (payload_length == 0 || payload_length > parity_length || payload_length > MAX_AUDIO_PACKET_SIZE) {
+          return false;
+        }
+        packet.fec_payload_lengths[i] = payload_length;
+      }
+
+      packet.payload = rtp_payload + fec_headers_length;
+      packet.payload_length = parity_length;
+      return true;
+    }
+
+    bool mic_parse_foundation_legacy(
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet
+    ) {
+      if (!data || bytes <= kRtpFixedHeaderSize || data[0] != 0 ||
+          (data[1] != 96 && data[1] != MIC_PACKET_TYPE_OPUS)) {
+        return false;
+      }
+
+      packet.kind = mic_packet_kind_e::data;
+      packet.sequence = (std::uint16_t) (data[2] | (data[3] << 8));
+      packet.payload = data + kRtpFixedHeaderSize;
+      packet.payload_length = bytes - kRtpFixedHeaderSize;
+      return packet.payload_length <= MAX_AUDIO_PACKET_SIZE;
+    }
+
+    bool mic_parse_foundation_ext_5504(
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet
+    ) {
+      if (!data || bytes <= 4 || mic_read_be16(data) != IDX_MIC_DATA_TYPE) {
+        return false;
+      }
+
+      const auto outer_sequence = (std::uint16_t) (data[2] | (data[3] << 8));
+      std::size_t offset = 4;
+      if (bytes >= 6) {
+        const auto declared_length = mic_read_be16(data + 4);
+        if (declared_length == bytes - 6 || declared_length == bytes - 4) {
+          offset = 6;
+        }
+      }
+      if (offset >= bytes) {
+        return false;
+      }
+
+      if (bytes - offset > kRtpFixedHeaderSize && mic_parse_foundation_legacy(data + offset, bytes - offset, packet)) {
+        return true;
+      }
+
+      packet.kind = mic_packet_kind_e::data;
+      packet.sequence = outer_sequence;
+      packet.payload = data + offset;
+      packet.payload_length = bytes - offset;
+      return packet.payload_length > 0 && packet.payload_length <= MAX_AUDIO_PACKET_SIZE;
+    }
+
+    bool mic_parse_packet(
+      const session_t &session,
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet
+    ) {
+      if (session.mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1) {
+        return mic_parse_moonlight_v1(session, data, bytes, packet);
+      }
+      return mic_parse_foundation_ext_5504(data, bytes, packet) ||
+             mic_parse_foundation_legacy(data, bytes, packet);
     }
 
     session_t *mic_find_session(broadcast_ctx_t &ctx, const udp::endpoint &peer) {
@@ -2931,19 +3265,8 @@ namespace stream {
     }
 
     void mic_on_packet(broadcast_ctx_t &ctx, const udp::endpoint &peer, const std::uint8_t *data, std::size_t bytes) {
-      bool is_fec = false;
-      std::uint16_t seq = 0;
-      const std::uint8_t *payload = nullptr;
-      std::size_t payload_len = 0;
-      const std::uint8_t *fec_base = nullptr;
-      std::size_t fec_len = 0;
-
-      if (!mic_parse_packet(data, bytes, is_fec, seq, payload, payload_len, fec_base, fec_len)) {
-        return;
-      }
-
-      // Keep the session alive in the control server's raw-pointer list while
-      // the packet is decoded and queued.
+      // Locate and retain the session before selecting a parser. The negotiated
+      // wire protocol is locked per session and never inferred from UDP bytes.
       auto sessions = ctx.control_server._sessions.lock();
       auto *session = mic_find_session(ctx, peer);
       if (!session) {
@@ -2955,15 +3278,34 @@ namespace stream {
         return;
       }
 
-      ++session->mic.packets_received;
-
-      if (is_fec) {
-        mic_handle_fec_shard(*session, fec_base, fec_len);
+      normalized_mic_packet_t packet;
+      if (!mic_parse_packet(*session, data, bytes, packet)) {
         return;
       }
 
-      std::vector<std::uint8_t> opus(payload, payload + payload_len);
-      mic_handle_data_shard(*session, seq, std::move(opus));
+      ++session->mic.packets_received;
+      std::vector<std::uint8_t> payload(packet.payload, packet.payload + packet.payload_length);
+
+      if (packet.kind == mic_packet_kind_e::fec) {
+        mic_handle_v1_fec_shard(
+          *session,
+          packet.ssrc,
+          packet.sequence,
+          packet.fec_data_ssrc,
+          packet.fec_base_sequence,
+          packet.fec_base_timestamp,
+          packet.fec_shard_index,
+          packet.fec_payload_lengths,
+          std::move(payload)
+        );
+        return;
+      }
+
+      if (session->mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1) {
+        mic_handle_v1_data_shard(*session, packet.sequence, packet.timestamp, packet.ssrc, std::move(payload));
+      } else {
+        mic_handle_legacy_data(*session, packet.sequence, std::move(payload));
+      }
     }
   }  // namespace
 
@@ -3090,11 +3432,17 @@ namespace stream {
     }
     session.mic.decoder.reset(dec);
 
-    session.mic.rs_fec_enabled = false;
     session.mic.pending.clear();
     session.mic.has_playout_cursor = false;
     session.mic.expected_seq = 0;
-    session.mic.rs_block.reset();
+    session.mic.data_ssrc = 0;
+    session.mic.parity_ssrc = 0;
+    session.mic.rs_blocks.clear();
+    session.mic.recent_data.clear();
+    session.mic.rs.reset();
+    if (session.mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1 && !mic_ensure_rs(session)) {
+      BOOST_LOG(warning) << "[mic] failed to initialize moonlight-mic/1 RS decoder"sv;
+    }
     session.mic.packets_received = 0;
     session.mic.frames_written = 0;
     session.mic.decode_errors = 0;
@@ -3104,7 +3452,9 @@ namespace stream {
       mic_session_acquire(*session.broadcast_ref.get());
     }
 
-    BOOST_LOG(info) << "[mic] session uplink started"sv;
+    BOOST_LOG(info) << "[mic] session uplink started (protocol="sv
+                    << (session.mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1 ? "moonlight-mic/1"sv : "foundation-legacy"sv)
+                    << ')';
     return 0;
   }
 
@@ -3132,10 +3482,13 @@ namespace stream {
     }
 
     session.mic.decoder.reset();
-    session.mic.rs_block.reset();
+    session.mic.rs_blocks.clear();
+    session.mic.recent_data.clear();
     session.mic.rs.reset();
     session.mic.pending.clear();
     session.mic.has_playout_cursor = false;
+    session.mic.data_ssrc = 0;
+    session.mic.parity_ssrc = 0;
     session.mic.audio_ctx = {};
     session.mic.enabled = false;
 
@@ -3974,6 +4327,7 @@ namespace stream {
       session->audio.timestamp = 0;
 
       session->mic.enabled = launch_session.enable_mic;
+      session->mic.protocol_version = launch_session.mic_protocol_version;
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
