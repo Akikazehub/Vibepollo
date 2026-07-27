@@ -246,8 +246,7 @@ namespace stream {
 
   enum class socket_e : int {
     video,  ///< Video
-    audio,  ///< Audio (host → client)
-    microphone  ///< Microphone uplink (client → host)
+    audio  ///< Audio (host → client)
   };
 
   namespace session {
@@ -678,7 +677,6 @@ namespace stream {
       std::mutex lock;
 
       // Baseline jitter buffer (Foundation-compatible, no RS)
-      static constexpr std::size_t max_queued = 32;
       struct queued_t {
         std::vector<std::uint8_t> opus;
         std::uint16_t seq = 0;
@@ -2500,6 +2498,7 @@ namespace stream {
     constexpr int kMicSampleRate = 48000;
     constexpr int kMicFrameSamples = 480;  // 10 ms
     constexpr int kMicMaxFrameSamples = 5760;  // 120 ms Opus limit
+    constexpr std::size_t kMicMaxQueued = 32;
 
     platf::audio_control_t *mic_audio_control(session_t &session) {
       if (session.mic.audio_ctx && session.mic.audio_ctx->control) {
@@ -2590,7 +2589,7 @@ namespace stream {
         if ((int) mic.pending.size() >= prebuffer) {
           mic.expected_seq = mic.pending.begin()->first;
           mic.has_playout_cursor = true;
-        } else if (mic.pending.size() >= mic.max_queued) {
+        } else if (mic.pending.size() >= kMicMaxQueued) {
           mic.expected_seq = mic.pending.begin()->first;
           mic.has_playout_cursor = true;
         } else {
@@ -2605,7 +2604,7 @@ namespace stream {
         mic.pending[seq] = decltype(mic.pending)::mapped_type {std::move(opus), seq};
       }
 
-      while (mic.pending.size() > mic.max_queued) {
+      while (mic.pending.size() > kMicMaxQueued) {
         // Prefer dropping the oldest relative to the cursor.
         auto it = mic.pending.begin();
         if (it->first == mic.expected_seq) {
@@ -3076,8 +3075,8 @@ namespace stream {
     session.mic.rs_recovered = 0;
 
     if (session.broadcast_ref) {
-      ensure_mic_sock_open(*session.broadcast_ref);
-      mic_session_acquire(*session.broadcast_ref);
+      ensure_mic_sock_open(*session.broadcast_ref.get());
+      mic_session_acquire(*session.broadcast_ref.get());
     }
 
     BOOST_LOG(info) << "[mic] session uplink started"sv;
@@ -3092,7 +3091,7 @@ namespace stream {
     std::lock_guard lg {session.mic.lock};
 
     if (session.broadcast_ref && session.mic.enabled) {
-      mic_session_release(*session.broadcast_ref);
+      mic_session_release(*session.broadcast_ref.get());
     }
 
     auto *control = mic_audio_control(session);
@@ -3112,7 +3111,7 @@ namespace stream {
     session.mic.rs.reset();
     session.mic.pending.clear();
     session.mic.has_playout_cursor = false;
-    session.mic.audio_ctx.reset();
+    session.mic.audio_ctx = {};
     session.mic.enabled = false;
 
     BOOST_LOG(info) << "[mic] session uplink stopped (pkts="sv << session.mic.packets_received
@@ -3566,11 +3565,8 @@ namespace stream {
       join_deadline_t join_deadline {hung_stage};
 
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
-            if (session.mic.enabled || session.mic.audio_ctx || session.mic.decoder) {
+      if (session.mic.enabled || session.mic.audio_ctx || session.mic.decoder) {
         mic_session_stop(session);
-        if (session.broadcast_ref) {
-          mic_session_release(*session.broadcast_ref);
-        }
       }
 
       session.videoThread.join();
@@ -4019,4 +4015,3 @@ namespace stream {
   }
 
 }  // namespace stream
-
