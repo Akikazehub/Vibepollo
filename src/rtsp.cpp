@@ -50,6 +50,11 @@ using asio::ip::udp;
 
 using namespace std::literals;
 
+// Sunshine/Foundation extension: microphone stream encryption (not in upstream Limelight.h yet).
+#ifndef SS_ENC_MIC
+  #define SS_ENC_MIC 0x08
+#endif
+
 #ifdef _WIN32
 namespace {
   constexpr wchar_t kVulkanHdrLayerGlobalActiveEventName[] = L"Global\\SunshineVirtualHdrActive";
@@ -214,6 +219,7 @@ namespace rtsp_stream {
     snapshot->frame_generation_provider = frame_generation_provider;
     snapshot->lossless_scaling_target_fps = lossless_scaling_target_fps;
     snapshot->lossless_scaling_rtss_limit = lossless_scaling_rtss_limit;
+    snapshot->enable_mic = enable_mic;
 #ifdef _WIN32
     snapshot->display_helper_gate = display_helper_gate;
 #endif
@@ -1287,6 +1293,14 @@ namespace rtsp_stream {
       }
     }
 
+    // Advertise mic encryption when mic uplink can be offered to this client.
+    const auto mic_status = stream::get_mic_status();
+    const bool advertise_mic = config::audio.stream_mic &&
+                               (config::audio.mic_require_steam ? mic_status.ready : mic_status.capable);
+    if (mic_status.capable) {
+      encryption_flags_supported |= SS_ENC_MIC;
+    }
+
     // Report supported and required encryption flags
     ss << "a=x-ss-general.encryptionSupported:" << encryption_flags_supported << std::endl;
     ss << "a=x-ss-general.encryptionRequested:" << encryption_flags_requested << std::endl;
@@ -1336,6 +1350,14 @@ namespace rtsp_stream {
       ss << std::endl;
     }
 
+    // Foundation-compatible client microphone uplink (UDP/RTP on MIC_STREAM_PORT).
+    if (advertise_mic) {
+      const auto mic_port = net::map_port(stream::MIC_STREAM_PORT);
+      ss << "m=audio " << mic_port << " RTP/AVP 96" << std::endl;
+      ss << "a=rtpmap:96 opus/48000/2" << std::endl;
+      ss << "a=fmtp:96 minptime=10;useinbandfec=1" << std::endl;
+    }
+
     respond(socket->sock, *session, &option, 200, "OK", req->sequenceNumber, ss.str());
     return false;
   }
@@ -1365,6 +1387,19 @@ namespace rtsp_stream {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
+    } else if (type == "mic"sv) {
+      // Accept SETUP even when the Steam backend is temporarily missing so Foundation
+      // clients can complete handshake; the stream path no-ops without a sink.
+      if (!config::audio.stream_mic) {
+        BOOST_LOG(warning) << "Rejecting mic SETUP: stream_mic is disabled"sv;
+        cmd_not_found(server, socket, session, std::move(req));
+        return false;
+      }
+      if (config::audio.mic_require_steam && !stream::mic_backend_ready()) {
+        BOOST_LOG(warning) << "Mic SETUP accepted but Steam Streaming Microphone is not ready"sv;
+      }
+      session->enable_mic = true;
+      port = net::map_port(stream::MIC_STREAM_PORT);
     } else {
       cmd_not_found(server, socket, session, std::move(req));
       return false;

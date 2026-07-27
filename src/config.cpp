@@ -954,6 +954,12 @@ namespace config {
     true,  // install_steam_drivers
     true,  // keep_sink_default
     true,  // auto_capture
+    true,  // stream_mic (Windows uplink; no-op on other platforms without backend)
+    true,  // mic_require_steam
+    "Speakers (Steam Streaming Microphone)",  // mic_sink
+    "Microphone (Steam Streaming Microphone)",  // mic_capture_device
+    50,  // mic_buffer_ms
+    2,  // mic_buffer_packets
   };
 
   stream_t stream {
@@ -2013,6 +2019,12 @@ namespace config {
     bool_f(vars, "install_steam_audio_drivers", audio.install_steam_drivers);
     bool_f(vars, "keep_sink_default", audio.keep_default);
     bool_f(vars, "auto_capture_sink", audio.auto_capture);
+    bool_f(vars, "stream_mic", audio.stream_mic);
+    bool_f(vars, "mic_require_steam", audio.mic_require_steam);
+    string_f(vars, "mic_sink", audio.mic_sink);
+    string_f(vars, "mic_capture_device", audio.mic_capture_device);
+    int_between_f(vars, "mic_buffer_ms", audio.mic_buffer_ms, {10, 200});
+    int_between_f(vars, "mic_buffer_packets", audio.mic_buffer_packets, {1, 16});
 
     string_restricted_f(vars, "origin_web_ui_allowed", nvhttp.origin_web_ui_allowed, {"pc"sv, "lan"sv, "wan"sv});
     // reflect origin ACL update immediately in HTTP layer

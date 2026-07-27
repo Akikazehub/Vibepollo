@@ -31,6 +31,7 @@ namespace stream {
   constexpr auto VIDEO_STREAM_PORT = 9;
   constexpr auto CONTROL_PORT = 10;
   constexpr auto AUDIO_STREAM_PORT = 11;
+  constexpr auto MIC_STREAM_PORT = 12;  ///< Client microphone uplink (UDP/RTP)
 
   constexpr std::string_view video_format_name(int video_format) {
     switch (video_format) {
@@ -74,6 +75,26 @@ namespace stream {
   }
 
   struct session_t;
+
+  /**
+   * @brief Snapshot of microphone uplink state for /serverinfo and the web UI.
+   */
+  struct mic_status_t {
+    bool capable = false;  ///< Feature built/enabled in config
+    bool ready = false;  ///< Steam Streaming Microphone endpoint present
+    bool session_active = false;  ///< At least one session requested mic
+    std::uint16_t port = 0;  ///< Mapped MIC_STREAM_PORT (0 if disabled)
+  };
+
+  /**
+   * @brief Probe whether the Steam mic backend can be initialized (lightweight).
+   */
+  bool mic_backend_ready();
+
+  /**
+   * @brief Current mic uplink advertisement/status snapshot.
+   */
+  mic_status_t get_mic_status();
 
   struct config_t {
     audio::config_t audio;

@@ -75,6 +75,8 @@ namespace rtsp_stream {
     int surround_info;
     std::string surround_params;
     bool continuous_audio;
+    /// Client requested microphone uplink via RTSP SETUP type "mic".
+    bool enable_mic = false;
     bool enable_hdr;
     // Resolved global/per-client preference for Main10 SDR when the client requests SDR.
     bool prefer_sdr_10bit = false;

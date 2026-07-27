@@ -613,6 +613,15 @@ namespace platf {
     virtual ~mic_t() = default;
   };
 
+  /**
+   * @brief Saved default capture endpoints so mic uplink can restore them later.
+   */
+  struct capture_snapshot_t {
+    std::string console_id;
+    std::string comms_id;
+    std::string multimedia_id;
+  };
+
   class audio_control_t {
   public:
     virtual int set_sink(const std::string &sink) = 0;
@@ -638,6 +647,45 @@ namespace platf {
      *        device is currently present.
      */
     virtual void reset_default_device(const std::string &preferred_device = {}) {}
+
+    /**
+     * @brief Initialize Steam Streaming Microphone render backend for client mic uplink.
+     * @return 0 on success, -1 if unavailable (Steam not running / endpoint missing).
+     */
+    virtual int init_mic_redirect_device() {
+      return -1;
+    }
+
+    /**
+     * @brief Release the mic redirect backend.
+     */
+    virtual void release_mic_redirect_device() {}
+
+    /**
+     * @brief Write mono float32 PCM into the mic redirect backend.
+     */
+    virtual int write_mic_pcm(const float * /*samples*/, std::uint32_t /*count*/) {
+      return -1;
+    }
+
+    /**
+     * @brief True if the Steam mic render endpoint can be opened right now.
+     */
+    virtual bool mic_redirect_available() {
+      return false;
+    }
+
+    virtual capture_snapshot_t snapshot_capture_defaults() {
+      return {};
+    }
+
+    virtual void switch_capture_to(const std::string & /*device_name*/) {}
+
+    virtual void restore_capture_from(const capture_snapshot_t & /*snapshot*/) {}
+
+    virtual std::string get_current_default_capture_name() {
+      return {};
+    }
 
     virtual ~audio_control_t() = default;
   };

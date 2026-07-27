@@ -2391,6 +2391,15 @@ namespace nvhttp {
           tree.put("root.VirtualDisplayDriverReady", true);
         }
 #endif
+        // Client microphone uplink advertisement (no RS-FEC flags).
+        {
+          auto mic = stream::get_mic_status();
+          tree.put("root.MicrophoneCapable", mic.capable);
+          tree.put("root.MicrophoneReady", mic.ready);
+          if (mic.port) {
+            tree.put("root.MicrophonePort", mic.port);
+          }
+        }
       } else {
         tree.put("root.mac", "00:00:00:00:00:00");
         tree.put("root.Permission", "0");
