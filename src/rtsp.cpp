@@ -23,6 +23,7 @@ extern "C" {
 #include <utility>
 
 // lib includes
+#include <boost/algorithm/string/predicate.hpp>
 #include <boost/asio.hpp>
 #include <boost/bind.hpp>
 #ifdef _WIN32
@@ -49,6 +50,11 @@ using asio::ip::tcp;
 using asio::ip::udp;
 
 using namespace std::literals;
+
+// Sunshine/Foundation extension: microphone stream encryption (not in upstream Limelight.h yet).
+#ifndef SS_ENC_MIC
+  #define SS_ENC_MIC 0x08
+#endif
 
 #ifdef _WIN32
 namespace {
@@ -214,6 +220,8 @@ namespace rtsp_stream {
     snapshot->frame_generation_provider = frame_generation_provider;
     snapshot->lossless_scaling_target_fps = lossless_scaling_target_fps;
     snapshot->lossless_scaling_rtss_limit = lossless_scaling_rtss_limit;
+    snapshot->enable_mic = enable_mic;
+    snapshot->mic_protocol_version = mic_protocol_version;
 #ifdef _WIN32
     snapshot->display_helper_gate = display_helper_gate;
 #endif
@@ -1287,6 +1295,14 @@ namespace rtsp_stream {
       }
     }
 
+    // Advertise mic encryption when mic uplink can be offered to this client.
+    const auto mic_status = stream::get_mic_status();
+    const bool advertise_mic = mic_status.capable &&
+                               (!config::audio.mic_require_steam || mic_status.ready);
+    if (mic_status.capable) {
+      encryption_flags_supported |= SS_ENC_MIC;
+    }
+
     // Report supported and required encryption flags
     ss << "a=x-ss-general.encryptionSupported:" << encryption_flags_supported << std::endl;
     ss << "a=x-ss-general.encryptionRequested:" << encryption_flags_requested << std::endl;
@@ -1336,17 +1352,29 @@ namespace rtsp_stream {
       ss << std::endl;
     }
 
+    // Versioned client microphone uplink (UDP/RTP on MIC_STREAM_PORT).
+    if (advertise_mic) {
+      const auto mic_port = net::map_port(stream::MIC_STREAM_PORT);
+      ss << "m=audio " << mic_port << " RTP/AVP 97 127" << std::endl;
+      ss << "a=rtpmap:97 opus/48000/2" << std::endl;
+      ss << "a=fmtp:97 minptime=20;useinbandfec=1;stereo=0;sprop-stereo=0" << std::endl;
+      ss << "a=rtpmap:127 moonlight-rs-fec/48000" << std::endl;
+      ss << "a=x-ss-mic-protocol:moonlight-mic" << std::endl;
+      ss << "a=x-ss-mic-versions:1" << std::endl;
+    }
+
     respond(socket->sock, *session, &option, 200, "OK", req->sequenceNumber, ss.str());
     return false;
   }
 
   bool cmd_setup(rtsp_server_t *server, std::shared_ptr<socket_t> socket, std::shared_ptr<launch_session_t> session, msg_t &&req) {
-    OPTION_ITEM options[4] {};
+    OPTION_ITEM options[5] {};
 
     auto &seqn = options[0];
     auto &session_option = options[1];
     auto &port_option = options[2];
     auto &payload_option = options[3];
+    auto &mic_protocol_option = options[4];
 
     seqn.option = const_cast<char *>("CSeq");
 
@@ -1365,6 +1393,36 @@ namespace rtsp_stream {
       port = net::map_port(stream::VIDEO_STREAM_PORT);
     } else if (type == "control"sv) {
       port = net::map_port(stream::CONTROL_PORT);
+    } else if (type == "mic"sv) {
+      // Accept SETUP even when the Steam backend is temporarily missing so Foundation
+      // clients can complete handshake; the stream path no-ops without a sink.
+      const auto mic_status = stream::get_mic_status();
+      if (!mic_status.capable) {
+        BOOST_LOG(warning) << "Rejecting mic SETUP: microphone uplink is unavailable"sv;
+        cmd_not_found(server, socket, session, std::move(req));
+        return false;
+      }
+      if (config::audio.mic_require_steam && !mic_status.ready) {
+        BOOST_LOG(warning) << "Mic SETUP accepted but Steam Streaming Microphone is not ready"sv;
+      }
+
+      const char *requested_protocol = nullptr;
+      for (auto option = req->options; option != nullptr; option = option->next) {
+        if (boost::iequals(std::string_view {option->option}, "X-SS-Mic-Protocol"sv)) {
+          requested_protocol = option->content;
+          break;
+        }
+      }
+
+      if (requested_protocol && std::string_view {requested_protocol} != "moonlight-mic/1"sv) {
+        BOOST_LOG(warning) << "Rejecting unsupported microphone protocol: "sv << requested_protocol;
+        respond(socket->sock, *session, &seqn, 461, "Unsupported Transport", req->sequenceNumber, {});
+        return false;
+      }
+
+      session->enable_mic = true;
+      session->mic_protocol_version = requested_protocol ? MIC_PROTOCOL_MOONLIGHT_V1 : MIC_PROTOCOL_FOUNDATION_LEGACY;
+      port = net::map_port(stream::MIC_STREAM_PORT);
     } else {
       cmd_not_found(server, socket, session, std::move(req));
       return false;
@@ -1394,6 +1452,12 @@ namespace rtsp_stream {
     }
 
     port_option.next = &payload_option;
+
+    if (type == "mic"sv && session->mic_protocol_version == MIC_PROTOCOL_MOONLIGHT_V1) {
+      payload_option.next = &mic_protocol_option;
+      mic_protocol_option.option = const_cast<char *>("X-SS-Mic-Protocol");
+      mic_protocol_option.content = const_cast<char *>("moonlight-mic/1");
+    }
 
     respond(socket->sock, *session, &seqn, 200, "OK", req->sequenceNumber, {});
     return false;

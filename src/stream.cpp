@@ -7,13 +7,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,20 +24,26 @@
 #include <system_error>
 #include <thread>
 #include <type_traits>
+#include <vector>
 
 // lib includes
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/endian/arithmetic.hpp>
 #include <openssl/err.h>
+#include <openssl/evp.h>
+
+#include <opus/opus.h>
 
 extern "C" {
   // clang-format off
 #include <moonlight-common-c/src/Limelight-internal.h>
+#include <moonlight-common-c/src/RtpAudioQueue.h>
 #include "rswrapper.h"
   // clang-format on
 }
 
 // local includes
+#include "audio.h"
 #include "config.h"
 #include "crypto.h"
 #include "display_device.h"
@@ -112,6 +121,19 @@ using asio::ip::tcp;
 using asio::ip::udp;
 
 using namespace std::literals;
+
+// Sunshine/Foundation extension: microphone stream encryption (not in upstream Limelight.h yet).
+#ifndef SS_ENC_MIC
+  #define SS_ENC_MIC 0x08
+#endif
+
+// Foundation mic packet type when using 16-bit extended RTP header.
+#ifndef IDX_MIC_DATA_TYPE
+  #define IDX_MIC_DATA_TYPE 0x5504
+#endif
+#ifndef MIC_PACKET_TYPE_OPUS
+  #define MIC_PACKET_TYPE_OPUS 97
+#endif
 
 namespace stream {
   namespace {
@@ -225,7 +247,7 @@ namespace stream {
 
   enum class socket_e : int {
     video,  ///< Video
-    audio  ///< Audio
+    audio  ///< Audio (host → client)
   };
 
   namespace session {
@@ -532,14 +554,62 @@ namespace stream {
     std::thread recv_thread;
     std::thread video_thread;
     std::thread audio_thread;
+    std::thread mic_thread;
     std::thread control_thread;
 
     asio::io_context io_context;
+    // Separate io_context so mic recv can be stopped independently.
+    asio::io_context mic_io_context;
 
     udp::socket video_sock {io_context};
     udp::socket audio_sock {io_context};
+    udp::socket mic_sock {mic_io_context};
+
+    std::atomic<bool> mic_socket_enabled {false};
+    std::atomic<int> mic_sessions_count {0};
+    std::mutex mic_start_mutex;
 
     control_server_t control_server;
+  };
+
+  struct mic_rs_block_key_t {
+    std::uint32_t ssrc = 0;
+    std::uint16_t base_seq = 0;
+
+    bool operator<(const mic_rs_block_key_t &other) const {
+      return ssrc < other.ssrc || (ssrc == other.ssrc && base_seq < other.base_seq);
+    }
+  };
+
+  struct mic_rs_block_t {
+    std::array<std::vector<std::uint8_t>, RTPA_DATA_SHARDS> data;
+    std::array<std::vector<std::uint8_t>, RTPA_FEC_SHARDS> fec;
+    std::array<std::uint16_t, RTPA_FEC_SHARDS> fec_sequences {};
+    std::array<std::uint8_t, RTPA_TOTAL_SHARDS> marks {};
+    std::array<std::uint16_t, RTPA_DATA_SHARDS> payload_lengths {};
+    std::uint32_t data_ssrc = 0;
+    std::uint32_t base_timestamp = 0;
+    std::uint16_t base_seq = 0;
+    std::size_t block_size = 0;
+    int data_count = 0;
+    int fec_count = 0;
+    bool has_fec_metadata = false;
+    std::chrono::steady_clock::time_point updated_at;
+  };
+
+  struct mic_recent_data_key_t {
+    std::uint32_t ssrc = 0;
+    std::uint16_t sequence = 0;
+
+    bool operator<(const mic_recent_data_key_t &other) const {
+      return ssrc < other.ssrc || (ssrc == other.ssrc && sequence < other.sequence);
+    }
+  };
+
+  struct mic_recent_data_t {
+    std::vector<std::uint8_t> wire_payload;
+    std::uint32_t timestamp = 0;
+    std::chrono::steady_clock::time_point updated_at;
   };
 
   struct session_t {
@@ -636,6 +706,39 @@ namespace stream {
     safe::mail_raw_t::event_t<bool> shutdown_event;
     safe::signal_t controlEnd;
 
+    // Microphone uplink (client → host via MIC_STREAM_PORT)
+    struct {
+      bool enabled = false;  ///< Session requested mic (RTSP SETUP mic)
+      std::uint8_t protocol_version = rtsp_stream::MIC_PROTOCOL_FOUNDATION_LEGACY;
+      bool capture_switched = false;
+      platf::capture_snapshot_t capture_snap {};
+      // Keep the shared audio context alive so the Steam mic backend outlives this session.
+      audio::audio_ctx_ref_t audio_ctx;
+      std::unique_ptr<OpusDecoder, void (*)(OpusDecoder *)> decoder {nullptr, opus_decoder_destroy};
+      std::mutex lock;
+
+      // Baseline jitter buffer (Foundation-compatible, no RS)
+      struct queued_t {
+        std::vector<std::uint8_t> opus;
+        std::uint16_t seq = 0;
+      };
+      std::map<std::uint16_t, queued_t> pending;
+      bool has_playout_cursor = false;
+      std::uint16_t expected_seq = 0;
+      std::uint32_t data_ssrc = 0;
+      std::uint32_t parity_ssrc = 0;
+
+      // moonlight-mic/1 keeps a small block window for data/parity reordering.
+      std::map<mic_rs_block_key_t, mic_rs_block_t> rs_blocks;
+      std::map<mic_recent_data_key_t, mic_recent_data_t> recent_data;
+      std::unique_ptr<reed_solomon, void (*)(reed_solomon *)> rs {nullptr, reed_solomon_release};
+
+      std::uint64_t packets_received = 0;
+      std::uint64_t frames_written = 0;
+      std::uint64_t decode_errors = 0;
+      std::uint64_t rs_recovered = 0;
+    } mic;
+
     std::atomic<session::state_e> state;
 
     // Real-time performance counters (updated by broadcast/control threads)
@@ -720,6 +823,15 @@ namespace stream {
   void end_broadcast(broadcast_ctx_t &ctx);
 
   static auto broadcast = safe::make_shared<broadcast_ctx_t>(start_broadcast, end_broadcast);
+
+  bool ensure_mic_sock_open(broadcast_ctx_t &ctx);
+  bool start_mic_receiver(broadcast_ctx_t &ctx);
+  void mic_session_acquire(broadcast_ctx_t &ctx);
+  void mic_session_release(broadcast_ctx_t &ctx);
+  int mic_session_start(session_t &session);
+  void mic_session_stop(session_t &session);
+  void micRecvThread(broadcast_ctx_t &ctx);
+
 
   std::optional<control_packet_view_t> decode_control_packet(std::string_view packet_bytes) {
     if (packet_bytes.size() < sizeof(std::uint16_t)) {
@@ -2417,6 +2529,1036 @@ namespace stream {
     shutdown_event->raise(true);
   }
 
+  namespace {
+    // Mono Opus @ 48 kHz with 10 ms packets (matches DESCRIBE minptime=10).
+    constexpr int kMicSampleRate = 48000;
+    constexpr int kMicFrameSamples = 480;  // 10 ms
+    constexpr int kMicMaxFrameSamples = 5760;  // 120 ms Opus limit
+    constexpr std::size_t kMicMaxQueued = 32;
+
+    platf::audio_control_t *mic_audio_control(session_t &session) {
+      if (session.mic.audio_ctx && session.mic.audio_ctx->control) {
+        return session.mic.audio_ctx->control.get();
+      }
+      return nullptr;
+    }
+
+    int decrypt_mic_payload(session_t &session, std::uint16_t seq, std::vector<std::uint8_t> &payload) {
+      if (!(session.config.encryptionFlagsEnabled & SS_ENC_MIC)) {
+        return 0;
+      }
+      if (payload.empty()) {
+        return -1;
+      }
+
+      // Same IV construction as audio downlink CBC, but keyed by mic seq.
+      crypto::aes_t iv(16, 0);
+      *(std::uint32_t *) iv.data() = util::endian::big<std::uint32_t>(session.audio.avRiKeyId + (seq & 0xFFFF));
+
+      auto &key = session.audio.cipher.key;
+      if (key.size() < 16) {
+        return -1;
+      }
+
+      crypto::cipher_ctx_t ctx {EVP_CIPHER_CTX_new()};
+      if (!ctx) {
+        return -1;
+      }
+
+      if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_128_cbc(), nullptr, key.data(), iv.data()) != 1) {
+        return -1;
+      }
+      EVP_CIPHER_CTX_set_padding(ctx.get(), 1);
+
+      std::vector<std::uint8_t> plain(payload.size() + 16);
+      int update_len = 0;
+      int final_len = 0;
+      if (EVP_DecryptUpdate(ctx.get(), plain.data(), &update_len, payload.data(), (int) payload.size()) != 1) {
+        return -1;
+      }
+      if (EVP_DecryptFinal_ex(ctx.get(), plain.data() + update_len, &final_len) != 1) {
+        return -1;
+      }
+
+      plain.resize((std::size_t) update_len + (std::size_t) final_len);
+      payload = std::move(plain);
+      return 0;
+    }
+
+    void mic_decode_and_write(session_t &session, const std::uint8_t *opus, std::size_t opus_len) {
+      auto *control = mic_audio_control(session);
+      if (!control || !session.mic.decoder) {
+        return;
+      }
+
+      std::array<float, kMicMaxFrameSamples> pcm {};
+      const int samples = opus_decode_float(
+        session.mic.decoder.get(),
+        opus_len ? opus : nullptr,
+        (int) opus_len,
+        pcm.data(),
+        kMicMaxFrameSamples,
+        0
+      );
+      if (samples < 0) {
+        ++session.mic.decode_errors;
+        BOOST_LOG(verbose) << "[mic] opus_decode_float failed: "sv << samples;
+        return;
+      }
+      if (samples == 0) {
+        return;
+      }
+
+      if (control->write_mic_pcm(pcm.data(), (std::uint32_t) samples) == 0) {
+        ++session.mic.frames_written;
+      }
+    }
+
+    std::optional<int> mic_v1_block_index(std::uint16_t base_sequence, std::uint16_t sequence) {
+      const auto offset = (std::uint16_t) (sequence - base_sequence);
+      if (offset >= RTPA_DATA_SHARDS) {
+        return std::nullopt;
+      }
+      return (int) offset;
+    }
+
+    bool mic_waiting_for_v1_fec(const session_t &session, std::uint16_t seq) {
+      if (session.mic.protocol_version != rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1) {
+        return false;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      for (const auto &[key, block] : session.mic.rs_blocks) {
+        const auto index = mic_v1_block_index(key.base_seq, seq);
+        if (block.has_fec_metadata && index && block.marks[*index] != 0 &&
+            now - block.updated_at <= std::chrono::milliseconds(RTPQ_OOS_WAIT_TIME_MS)) {
+          return true;
+        }
+      }
+
+      // Before parity arrives there is no authoritative block base. A nearby
+      // later data packet is enough to defer PLC briefly without inventing one.
+      for (const auto &[key, recent] : session.mic.recent_data) {
+        const auto distance = (std::uint16_t) (key.sequence - seq);
+        if (distance > 0 && distance < RTPA_DATA_SHARDS &&
+            now - recent.updated_at <= std::chrono::milliseconds(RTPQ_OOS_WAIT_TIME_MS)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    void mic_queue_opus(session_t &session, std::uint16_t seq, std::vector<std::uint8_t> &&opus) {
+      auto &mic = session.mic;
+      const int configured_prebuffer = std::clamp(config::audio.mic_buffer_packets, 1, 16);
+      int prebuffer = configured_prebuffer;
+      if (mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1) {
+        prebuffer = std::max(prebuffer, RTPA_DATA_SHARDS);
+      }
+
+      if (!mic.has_playout_cursor) {
+        if (mic.pending.empty()) {
+          mic.expected_seq = seq;
+        } else {
+          const auto delta = (std::int16_t) (seq - mic.expected_seq);
+          if (delta < 0 && delta >= -16) {
+            mic.expected_seq = seq;
+          }
+        }
+        mic.pending[seq] = decltype(mic.pending)::mapped_type {std::move(opus), seq};
+        if ((int) mic.pending.size() >= prebuffer) {
+          mic.has_playout_cursor = true;
+        } else if (mic.pending.size() >= kMicMaxQueued) {
+          mic.has_playout_cursor = true;
+        } else {
+          return;
+        }
+      } else {
+        // Drop hopelessly late packets (more than half the seq space behind).
+        const std::int16_t delta = (std::int16_t) (seq - mic.expected_seq);
+        if (delta < -16) {
+          return;
+        }
+        mic.pending[seq] = decltype(mic.pending)::mapped_type {std::move(opus), seq};
+      }
+
+      while (mic.pending.size() > kMicMaxQueued) {
+        auto farthest = std::max_element(mic.pending.begin(), mic.pending.end(), [&](const auto &left, const auto &right) {
+          return (std::uint16_t) (left.first - mic.expected_seq) <
+                 (std::uint16_t) (right.first - mic.expected_seq);
+        });
+        if (farthest == mic.pending.end() || farthest->first == mic.expected_seq) {
+          break;
+        }
+        mic.pending.erase(farthest);
+      }
+
+      // Contiguous playout; limited PLC via Opus null-packet on small gaps.
+      int missing_skipped = 0;
+      while (true) {
+        auto it = mic.pending.find(mic.expected_seq);
+        if (it != mic.pending.end()) {
+          mic_decode_and_write(session, it->second.opus.data(), it->second.opus.size());
+          mic.pending.erase(it);
+          ++mic.expected_seq;
+          missing_skipped = 0;
+          continue;
+        }
+
+        if (mic.pending.empty()) {
+          break;
+        }
+
+        // If we already have later packets, fill a short gap with PLC then continue.
+        auto next_it = std::min_element(mic.pending.begin(), mic.pending.end(), [&](const auto &left, const auto &right) {
+          return (std::uint16_t) (left.first - mic.expected_seq) <
+                 (std::uint16_t) (right.first - mic.expected_seq);
+        });
+        const auto next = next_it->first;
+        const auto gap = (std::uint16_t) (next - mic.expected_seq);
+        if (gap >= 0x8000) {
+          mic.pending.erase(next_it);
+          continue;
+        }
+        if (mic_waiting_for_v1_fec(session, mic.expected_seq)) {
+          break;
+        }
+        if (gap > 8 || missing_skipped >= 4) {
+          // Large loss: jump forward rather than synthesizing a long stretch.
+          mic.expected_seq = next;
+          missing_skipped = 0;
+          continue;
+        }
+
+        mic_decode_and_write(session, nullptr, 0);
+        ++mic.expected_seq;
+        ++missing_skipped;
+      }
+    }
+
+    bool mic_ensure_rs(session_t &session) {
+      if (!session.mic.rs) {
+        session.mic.rs.reset(reed_solomon_new(RTPA_DATA_SHARDS, RTPA_FEC_SHARDS));
+        if (session.mic.rs) {
+          // Fixed OpenFEC/NVIDIA matrix used by moonlight-mic/1.
+          const unsigned char parity[] = {0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c};
+          std::memcpy(session.mic.rs->p, parity, sizeof(parity));
+        }
+      }
+      return session.mic.rs != nullptr;
+    }
+
+    mic_rs_block_t &mic_get_rs_block(session_t &session, std::uint32_t data_ssrc, std::uint16_t base_seq) {
+      auto &blocks = session.mic.rs_blocks;
+      const mic_rs_block_key_t key {data_ssrc, base_seq};
+      auto [it, inserted] = blocks.try_emplace(key);
+      if (inserted) {
+        it->second.data_ssrc = data_ssrc;
+        it->second.base_seq = base_seq;
+        it->second.marks.fill(1);
+      }
+      it->second.updated_at = std::chrono::steady_clock::now();
+
+      if (inserted && blocks.size() > RTPA_CACHED_FEC_BLOCK_LIMIT) {
+        auto oldest = blocks.end();
+        for (auto candidate = blocks.begin(); candidate != blocks.end(); ++candidate) {
+          if (candidate != it && (oldest == blocks.end() || candidate->second.updated_at < oldest->second.updated_at)) {
+            oldest = candidate;
+          }
+        }
+        if (oldest != blocks.end()) {
+          blocks.erase(oldest);
+        }
+      }
+
+      return it->second;
+    }
+
+    bool mic_store_recent_v1_data(
+      session_t &session,
+      std::uint32_t data_ssrc,
+      std::uint16_t sequence,
+      std::uint32_t timestamp,
+      const std::vector<std::uint8_t> &wire_payload
+    ) {
+      constexpr std::size_t kRecentDataLimit = RTPA_CACHED_FEC_BLOCK_LIMIT * RTPA_DATA_SHARDS;
+      auto &recent_data = session.mic.recent_data;
+      const mic_recent_data_key_t key {data_ssrc, sequence};
+      auto [it, inserted] = recent_data.try_emplace(key);
+      if (!inserted) {
+        return false;
+      }
+
+      it->second.wire_payload = wire_payload;
+      it->second.timestamp = timestamp;
+      it->second.updated_at = std::chrono::steady_clock::now();
+      if (recent_data.size() > kRecentDataLimit) {
+        auto oldest = recent_data.end();
+        for (auto candidate = recent_data.begin(); candidate != recent_data.end(); ++candidate) {
+          if (candidate != it && (oldest == recent_data.end() || candidate->second.updated_at < oldest->second.updated_at)) {
+            oldest = candidate;
+          }
+        }
+        if (oldest != recent_data.end()) {
+          recent_data.erase(oldest);
+        }
+      }
+      return true;
+    }
+
+    bool mic_v1_data_matches_block(
+      const mic_rs_block_t &block,
+      int index,
+      std::uint32_t timestamp,
+      const std::vector<std::uint8_t> &wire_payload
+    ) {
+      return block.has_fec_metadata &&
+             wire_payload.size() == block.payload_lengths[index] &&
+             (index != 0 || timestamp == block.base_timestamp);
+    }
+
+    void mic_attach_v1_data_to_block(
+      mic_rs_block_t &block,
+      int index,
+      const std::vector<std::uint8_t> &wire_payload
+    ) {
+      block.data[index] = wire_payload;
+      block.marks[index] = 0;
+      ++block.data_count;
+      block.updated_at = std::chrono::steady_clock::now();
+    }
+
+    void mic_rs_try_recover(session_t &session, mic_rs_block_t &block) {
+      auto &mic = session.mic;
+      if (!block.has_fec_metadata || block.block_size == 0 || !mic_ensure_rs(session)) {
+        return;
+      }
+      if (block.data_count + block.fec_count < RTPA_DATA_SHARDS) {
+        return;
+      }
+      if (block.data_count == RTPA_DATA_SHARDS) {
+        // Already complete — nothing to recover.
+        return;
+      }
+
+      std::array<std::uint8_t *, RTPA_TOTAL_SHARDS> shards_p {};
+      std::array<std::vector<std::uint8_t>, RTPA_TOTAL_SHARDS> storage {};
+      for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
+        storage[i].assign(block.block_size, 0);
+        if (!block.data[i].empty()) {
+          if (block.data[i].size() > block.block_size) {
+            return;
+          }
+          std::memcpy(storage[i].data(), block.data[i].data(), block.data[i].size());
+        }
+        shards_p[i] = storage[i].data();
+      }
+      for (int i = 0; i < RTPA_FEC_SHARDS; ++i) {
+        storage[RTPA_DATA_SHARDS + i].assign(block.block_size, 0);
+        if (!block.fec[i].empty()) {
+          if (block.fec[i].size() != block.block_size) {
+            return;
+          }
+          std::memcpy(storage[RTPA_DATA_SHARDS + i].data(), block.fec[i].data(), block.fec[i].size());
+        }
+        shards_p[RTPA_DATA_SHARDS + i] = storage[RTPA_DATA_SHARDS + i].data();
+      }
+
+      auto marks = block.marks;
+      if (reed_solomon_decode(mic.rs.get(), shards_p.data(), marks.data(), RTPA_TOTAL_SHARDS, (int) block.block_size) != 0) {
+        return;
+      }
+
+      for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
+        if (block.marks[i] == 0) {
+          continue;  // already present
+        }
+        const auto payload_length = block.payload_lengths[i];
+        if (payload_length == 0 || payload_length > block.block_size) {
+          return;
+        }
+
+        std::vector<std::uint8_t> recovered_wire_payload(shards_p[i], shards_p[i] + payload_length);
+        auto opus = recovered_wire_payload;
+        if (decrypt_mic_payload(session, (std::uint16_t) (block.base_seq + i), opus) != 0) {
+          BOOST_LOG(verbose) << "[mic] decrypt failed for recovered seq="sv << (std::uint16_t) (block.base_seq + i);
+          continue;
+        }
+
+        block.data[i] = std::move(recovered_wire_payload);
+        block.marks[i] = 0;
+        ++block.data_count;
+        ++mic.rs_recovered;
+        mic_queue_opus(session, (std::uint16_t) (block.base_seq + i), std::move(opus));
+      }
+    }
+
+    void mic_handle_v1_fec_shard(
+      session_t &session,
+      std::uint32_t parity_ssrc,
+      std::uint16_t parity_sequence,
+      std::uint32_t data_ssrc,
+      std::uint16_t base_seq,
+      std::uint32_t base_timestamp,
+      std::uint8_t shard_index,
+      const std::array<std::uint16_t, RTPA_DATA_SHARDS> &payload_lengths,
+      std::vector<std::uint8_t> &&parity
+    ) {
+      if (parity_ssrc == data_ssrc ||
+          (session.mic.data_ssrc != 0 && session.mic.data_ssrc != data_ssrc) ||
+          (session.mic.parity_ssrc != 0 && session.mic.parity_ssrc != parity_ssrc)) {
+        return;
+      }
+      if (session.mic.parity_ssrc == 0) {
+        session.mic.parity_ssrc = parity_ssrc;
+      }
+      if (session.mic.data_ssrc == 0) {
+        session.mic.data_ssrc = data_ssrc;
+      }
+
+      auto &block = mic_get_rs_block(session, data_ssrc, base_seq);
+
+      if (block.has_fec_metadata) {
+        if (block.base_timestamp != base_timestamp || block.block_size != parity.size() ||
+            block.payload_lengths != payload_lengths) {
+          return;
+        }
+      } else {
+        for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
+          const mic_recent_data_key_t key {data_ssrc, (std::uint16_t) (base_seq + i)};
+          const auto recent = session.mic.recent_data.find(key);
+          if (recent != session.mic.recent_data.end() &&
+              (recent->second.wire_payload.size() != payload_lengths[i] ||
+               (i == 0 && recent->second.timestamp != base_timestamp))) {
+            return;
+          }
+        }
+        block.base_timestamp = base_timestamp;
+        block.block_size = parity.size();
+        block.payload_lengths = payload_lengths;
+        block.has_fec_metadata = true;
+
+        for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
+          const mic_recent_data_key_t key {data_ssrc, (std::uint16_t) (base_seq + i)};
+          const auto recent = session.mic.recent_data.find(key);
+          if (recent != session.mic.recent_data.end() && block.marks[i] != 0) {
+            mic_attach_v1_data_to_block(block, i, recent->second.wire_payload);
+          }
+        }
+      }
+
+      if (block.marks[RTPA_DATA_SHARDS + shard_index] == 0) {
+        return;
+      }
+      for (int i = 0; i < RTPA_FEC_SHARDS; ++i) {
+        if (i != shard_index && block.marks[RTPA_DATA_SHARDS + i] == 0 &&
+            block.fec_sequences[i] == parity_sequence) {
+          return;
+        }
+      }
+
+      block.fec[shard_index] = std::move(parity);
+      block.fec_sequences[shard_index] = parity_sequence;
+      block.marks[RTPA_DATA_SHARDS + shard_index] = 0;
+      ++block.fec_count;
+      mic_rs_try_recover(session, block);
+    }
+
+    void mic_handle_v1_data_shard(
+      session_t &session,
+      std::uint16_t seq,
+      std::uint32_t timestamp,
+      std::uint32_t data_ssrc,
+      std::vector<std::uint8_t> &&wire_payload
+    ) {
+      if ((session.mic.data_ssrc != 0 && session.mic.data_ssrc != data_ssrc) ||
+          session.mic.parity_ssrc == data_ssrc) {
+        return;
+      }
+      if (session.mic.data_ssrc == 0) {
+        session.mic.data_ssrc = data_ssrc;
+      }
+
+      mic_rs_block_t *matching_block = nullptr;
+      int matching_index = 0;
+      for (auto &[key, block] : session.mic.rs_blocks) {
+        if (key.ssrc != data_ssrc || !block.has_fec_metadata) {
+          continue;
+        }
+        const auto index = mic_v1_block_index(key.base_seq, seq);
+        if (!index) {
+          continue;
+        }
+        if (matching_block) {
+          return;  // Reject ambiguous overlapping FEC metadata.
+        }
+        matching_block = &block;
+        matching_index = *index;
+      }
+
+      if (matching_block &&
+          (matching_block->marks[matching_index] == 0 ||
+           !mic_v1_data_matches_block(*matching_block, matching_index, timestamp, wire_payload))) {
+        return;
+      }
+
+      auto opus = wire_payload;
+      if (decrypt_mic_payload(session, seq, opus) != 0) {
+        BOOST_LOG(verbose) << "[mic] decrypt failed seq="sv << seq;
+        return;
+      }
+
+      if (!mic_store_recent_v1_data(session, data_ssrc, seq, timestamp, wire_payload)) {
+        return;
+      }
+
+      // FEC protects the exact wire payload. Keep this copy encrypted while a
+      // second copy follows the normal decrypt/jitter path immediately.
+      if (matching_block) {
+        mic_attach_v1_data_to_block(*matching_block, matching_index, wire_payload);
+        mic_rs_try_recover(session, *matching_block);
+      }
+
+      mic_queue_opus(session, seq, std::move(opus));
+    }
+
+    void mic_handle_legacy_data(session_t &session, std::uint16_t seq, std::vector<std::uint8_t> &&payload) {
+      if (decrypt_mic_payload(session, seq, payload) != 0) {
+        BOOST_LOG(verbose) << "[mic] legacy decrypt failed seq="sv << seq;
+        return;
+      }
+      mic_queue_opus(session, seq, std::move(payload));
+    }
+
+    enum class mic_packet_kind_e : std::uint8_t {
+      data,
+      fec
+    };
+
+    struct normalized_mic_packet_t {
+      mic_packet_kind_e kind = mic_packet_kind_e::data;
+      std::uint16_t sequence = 0;
+      std::uint32_t timestamp = 0;
+      std::uint32_t ssrc = 0;
+      const std::uint8_t *payload = nullptr;
+      std::size_t payload_length = 0;
+
+      std::uint8_t fec_shard_index = 0;
+      std::uint16_t fec_base_sequence = 0;
+      std::uint32_t fec_base_timestamp = 0;
+      std::uint32_t fec_data_ssrc = 0;
+      std::array<std::uint16_t, RTPA_DATA_SHARDS> fec_payload_lengths {};
+    };
+
+    constexpr std::size_t kRtpFixedHeaderSize = 12;
+    constexpr std::size_t kAudioFecHeaderSize = 12;
+    constexpr std::size_t kMicFecV1ExtensionSize = 12;
+    constexpr std::uint8_t kMicFecEncryptedFlag = 0x01;
+
+    std::uint16_t mic_read_be16(const std::uint8_t *data) {
+      return (std::uint16_t) ((data[0] << 8) | data[1]);
+    }
+
+    std::uint32_t mic_read_be32(const std::uint8_t *data) {
+      return ((std::uint32_t) data[0] << 24) |
+             ((std::uint32_t) data[1] << 16) |
+             ((std::uint32_t) data[2] << 8) |
+             data[3];
+    }
+
+    bool mic_parse_v1_rtp_header(
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet,
+      std::uint8_t &payload_type,
+      std::size_t &header_length
+    ) {
+      if (!data || bytes < kRtpFixedHeaderSize || (data[0] & 0xc0) != 0x80 || (data[0] & 0x20) != 0 ||
+          (data[1] & 0x80) != 0) {
+        return false;
+      }
+
+      header_length = kRtpFixedHeaderSize + (std::size_t) (data[0] & 0x0f) * 4;
+      if (header_length > bytes) {
+        return false;
+      }
+
+      if ((data[0] & 0x10) != 0) {
+        if (bytes - header_length < 4) {
+          return false;
+        }
+        const auto extension_words = mic_read_be16(data + header_length + 2);
+        const auto extension_bytes = (std::size_t) extension_words * 4;
+        if (extension_bytes > bytes - header_length - 4) {
+          return false;
+        }
+        header_length += 4 + extension_bytes;
+      }
+
+      payload_type = data[1] & 0x7f;
+      packet.sequence = mic_read_be16(data + 2);
+      packet.timestamp = mic_read_be32(data + 4);
+      packet.ssrc = mic_read_be32(data + 8);
+      return packet.ssrc != 0;
+    }
+
+    bool mic_parse_moonlight_v1(
+      const session_t &session,
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet
+    ) {
+      std::uint8_t payload_type = 0;
+      std::size_t header_length = 0;
+      if (!mic_parse_v1_rtp_header(data, bytes, packet, payload_type, header_length)) {
+        return false;
+      }
+
+      const auto *rtp_payload = data + header_length;
+      const auto rtp_payload_length = bytes - header_length;
+      if (payload_type == MIC_PACKET_TYPE_OPUS) {
+        if (rtp_payload_length == 0 || rtp_payload_length > MAX_AUDIO_PACKET_SIZE) {
+          return false;
+        }
+        packet.kind = mic_packet_kind_e::data;
+        packet.payload = rtp_payload;
+        packet.payload_length = rtp_payload_length;
+        return true;
+      }
+
+      if (payload_type != 127 || rtp_payload_length < kAudioFecHeaderSize + kMicFecV1ExtensionSize + 1) {
+        return false;
+      }
+
+      const auto *fec = rtp_payload;
+      const auto *extension = fec + kAudioFecHeaderSize;
+      const auto extension_length = mic_read_be16(extension + 2);
+      if (fec[0] >= RTPA_FEC_SHARDS || fec[1] != MIC_PACKET_TYPE_OPUS || extension[0] != 1 ||
+          extension_length != kMicFecV1ExtensionSize || (extension[1] & ~kMicFecEncryptedFlag) != 0) {
+        return false;
+      }
+
+      const bool protected_payload_encrypted = (extension[1] & kMicFecEncryptedFlag) != 0;
+      const bool session_encrypted = (session.config.encryptionFlagsEnabled & SS_ENC_MIC) != 0;
+      if (protected_payload_encrypted != session_encrypted) {
+        return false;
+      }
+
+      const auto fec_headers_length = kAudioFecHeaderSize + (std::size_t) extension_length;
+      if (fec_headers_length >= rtp_payload_length) {
+        return false;
+      }
+      const auto parity_length = rtp_payload_length - fec_headers_length;
+      if (parity_length == 0 || parity_length > MAX_AUDIO_PACKET_SIZE) {
+        return false;
+      }
+
+      packet.kind = mic_packet_kind_e::fec;
+      packet.fec_shard_index = fec[0];
+      packet.fec_base_sequence = mic_read_be16(fec + 2);
+      packet.fec_base_timestamp = mic_read_be32(fec + 4);
+      packet.fec_data_ssrc = mic_read_be32(fec + 8);
+      if (packet.fec_data_ssrc == 0) {
+        return false;
+      }
+
+      for (int i = 0; i < RTPA_DATA_SHARDS; ++i) {
+        const auto payload_length = mic_read_be16(extension + 4 + i * 2);
+        if (payload_length == 0 || payload_length > parity_length || payload_length > MAX_AUDIO_PACKET_SIZE) {
+          return false;
+        }
+        packet.fec_payload_lengths[i] = payload_length;
+      }
+
+      packet.payload = rtp_payload + fec_headers_length;
+      packet.payload_length = parity_length;
+      return true;
+    }
+
+    bool mic_parse_foundation_legacy(
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet
+    ) {
+      if (!data || bytes <= kRtpFixedHeaderSize || data[0] != 0 ||
+          (data[1] != 96 && data[1] != MIC_PACKET_TYPE_OPUS)) {
+        return false;
+      }
+
+      packet.kind = mic_packet_kind_e::data;
+      packet.sequence = (std::uint16_t) (data[2] | (data[3] << 8));
+      packet.payload = data + kRtpFixedHeaderSize;
+      packet.payload_length = bytes - kRtpFixedHeaderSize;
+      return packet.payload_length <= MAX_AUDIO_PACKET_SIZE;
+    }
+
+    bool mic_parse_foundation_ext_5504(
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet
+    ) {
+      if (!data || bytes <= 4 || mic_read_be16(data) != IDX_MIC_DATA_TYPE) {
+        return false;
+      }
+
+      const auto outer_sequence = (std::uint16_t) (data[2] | (data[3] << 8));
+      std::size_t offset = 4;
+      if (bytes >= 6) {
+        const auto declared_length = mic_read_be16(data + 4);
+        if (declared_length == bytes - 6 || declared_length == bytes - 4) {
+          offset = 6;
+        }
+      }
+      if (offset >= bytes) {
+        return false;
+      }
+
+      if (bytes - offset > kRtpFixedHeaderSize && mic_parse_foundation_legacy(data + offset, bytes - offset, packet)) {
+        return true;
+      }
+
+      packet.kind = mic_packet_kind_e::data;
+      packet.sequence = outer_sequence;
+      packet.payload = data + offset;
+      packet.payload_length = bytes - offset;
+      return packet.payload_length > 0 && packet.payload_length <= MAX_AUDIO_PACKET_SIZE;
+    }
+
+    bool mic_parse_packet(
+      const session_t &session,
+      const std::uint8_t *data,
+      std::size_t bytes,
+      normalized_mic_packet_t &packet
+    ) {
+      if (session.mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1) {
+        return mic_parse_moonlight_v1(session, data, bytes, packet);
+      }
+      return mic_parse_foundation_ext_5504(data, bytes, packet) ||
+             mic_parse_foundation_legacy(data, bytes, packet);
+    }
+
+    session_t *mic_find_session(broadcast_ctx_t &ctx, const udp::endpoint &peer) {
+      for (auto *session : *ctx.control_server._sessions) {
+        if (!session || !session->mic.enabled) {
+          continue;
+        }
+        if (session->state.load(std::memory_order_relaxed) != session::state_e::RUNNING) {
+          continue;
+        }
+
+        // Prefer the session whose control/audio/video peer IP matches the sender.
+        if (session->audio.peer.address() == peer.address() ||
+            session->video.peer.address() == peer.address()) {
+          return session;
+        }
+        if (session->control.peer) {
+          TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
+          (void) port;
+          boost::system::error_code ec;
+          auto control_addr = boost::asio::ip::make_address(addr, ec);
+          if (!ec && control_addr == peer.address()) {
+            return session;
+          }
+        }
+      }
+      return nullptr;
+    }
+
+    void mic_on_packet(broadcast_ctx_t &ctx, const udp::endpoint &peer, const std::uint8_t *data, std::size_t bytes) {
+      // Locate and retain the session before selecting a parser. The negotiated
+      // wire protocol is locked per session and never inferred from UDP bytes.
+      auto sessions = ctx.control_server._sessions.lock();
+      auto *session = mic_find_session(ctx, peer);
+      if (!session) {
+        return;
+      }
+
+      std::lock_guard lg {session->mic.lock};
+      if (!session->mic.enabled || !session->mic.decoder) {
+        return;
+      }
+
+      normalized_mic_packet_t packet;
+      if (!mic_parse_packet(*session, data, bytes, packet)) {
+        return;
+      }
+
+      ++session->mic.packets_received;
+      std::vector<std::uint8_t> payload(packet.payload, packet.payload + packet.payload_length);
+
+      if (packet.kind == mic_packet_kind_e::fec) {
+        mic_handle_v1_fec_shard(
+          *session,
+          packet.ssrc,
+          packet.sequence,
+          packet.fec_data_ssrc,
+          packet.fec_base_sequence,
+          packet.fec_base_timestamp,
+          packet.fec_shard_index,
+          packet.fec_payload_lengths,
+          std::move(payload)
+        );
+        return;
+      }
+
+      if (session->mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1) {
+        mic_handle_v1_data_shard(*session, packet.sequence, packet.timestamp, packet.ssrc, std::move(payload));
+      } else {
+        mic_handle_legacy_data(*session, packet.sequence, std::move(payload));
+      }
+    }
+  }  // namespace
+
+  bool ensure_mic_sock_open(broadcast_ctx_t &ctx) {
+    if (ctx.mic_socket_enabled.load(std::memory_order_acquire)) {
+      return true;
+    }
+    if (!config::audio.stream_mic) {
+      return false;
+    }
+
+    auto address_family = net::af_from_enum_string(config::sunshine.address_family);
+    auto bind_addr_str = net::get_bind_address(address_family);
+    boost::system::error_code ec;
+    const auto bind_addr = boost::asio::ip::make_address(bind_addr_str, ec);
+    if (ec) {
+      BOOST_LOG(error) << "[mic] Invalid bind address: "sv << bind_addr_str << " - " << ec.message();
+      return false;
+    }
+
+    auto protocol = net::udp_protocol_for_address(bind_addr);
+    auto mic_port = net::map_port(MIC_STREAM_PORT);
+
+    if (ctx.mic_sock.is_open()) {
+      ctx.mic_sock.close();
+    }
+
+    ctx.mic_io_context.restart();
+    ctx.mic_sock.open(protocol, ec);
+    if (ec) {
+      BOOST_LOG(error) << "[mic] Couldn't open mic UDP socket: "sv << ec.message();
+      return false;
+    }
+
+    ctx.mic_sock.bind(udp::endpoint(bind_addr, mic_port), ec);
+    if (ec) {
+      BOOST_LOG(error) << "[mic] Couldn't bind mic UDP socket to port ["sv << mic_port << "]: "sv << ec.message();
+      ctx.mic_sock.close();
+      return false;
+    }
+
+    ctx.mic_socket_enabled.store(true, std::memory_order_release);
+    BOOST_LOG(info) << "[mic] UDP socket listening on port "sv << mic_port;
+    return true;
+  }
+
+  bool start_mic_receiver(broadcast_ctx_t &ctx) {
+    std::lock_guard lg {ctx.mic_start_mutex};
+    if (ctx.mic_thread.joinable()) {
+      return true;
+    }
+    if (!ensure_mic_sock_open(ctx)) {
+      return false;
+    }
+    if (ctx.mic_io_context.stopped()) {
+      ctx.mic_io_context.restart();
+    }
+    ctx.mic_thread = std::thread {micRecvThread, std::ref(ctx)};
+    return true;
+  }
+
+  void mic_session_acquire(broadcast_ctx_t &ctx) {
+    ctx.mic_sessions_count.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  void mic_session_release(broadcast_ctx_t &ctx) {
+    const auto remaining = ctx.mic_sessions_count.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    if (remaining < 0) {
+      ctx.mic_sessions_count.store(0, std::memory_order_release);
+    }
+  }
+
+  int mic_session_start(session_t &session) {
+    if (!session.mic.enabled) {
+      return 0;
+    }
+    if (!config::audio.stream_mic) {
+      BOOST_LOG(warning) << "[mic] session requested mic but stream_mic is disabled"sv;
+      session.mic.enabled = false;
+      return -1;
+    }
+
+    if (!session.broadcast_ref || !start_mic_receiver(*session.broadcast_ref.get())) {
+      BOOST_LOG(warning) << "[mic] failed to start UDP receiver"sv;
+      session.mic.enabled = false;
+      return -1;
+    }
+
+#ifdef _WIN32
+    // Reuse the process-wide audio context so the Steam backend stays warm.
+    session.mic.audio_ctx = audio::get_audio_ctx_ref();
+    auto *control = mic_audio_control(session);
+    if (!control) {
+      BOOST_LOG(error) << "[mic] no audio control available"sv;
+      session.mic.enabled = false;
+      return -1;
+    }
+
+    if (config::audio.mic_require_steam && !control->mic_redirect_available()) {
+      BOOST_LOG(warning) << "[mic] Steam Streaming Microphone not ready; uplink will no-op"sv;
+    }
+
+    if (control->init_mic_redirect_device() != 0) {
+      BOOST_LOG(warning) << "[mic] init_mic_redirect_device failed; packets will be dropped"sv;
+    }
+
+    if (!config::audio.mic_capture_device.empty()) {
+      session.mic.capture_snap = control->snapshot_capture_defaults();
+      control->switch_capture_to(config::audio.mic_capture_device);
+      session.mic.capture_switched = true;
+    }
+#else
+    BOOST_LOG(warning) << "[mic] uplink is only implemented on Windows"sv;
+    session.mic.enabled = false;
+    return -1;
+#endif
+
+    int err = 0;
+    OpusDecoder *dec = opus_decoder_create(kMicSampleRate, 1, &err);
+    if (!dec || err != OPUS_OK) {
+      BOOST_LOG(error) << "[mic] opus_decoder_create failed: "sv << err;
+      session.mic.enabled = false;
+      return -1;
+    }
+    session.mic.decoder.reset(dec);
+
+    session.mic.pending.clear();
+    session.mic.has_playout_cursor = false;
+    session.mic.expected_seq = 0;
+    session.mic.data_ssrc = 0;
+    session.mic.parity_ssrc = 0;
+    session.mic.rs_blocks.clear();
+    session.mic.recent_data.clear();
+    session.mic.rs.reset();
+    if (session.mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1 && !mic_ensure_rs(session)) {
+      BOOST_LOG(warning) << "[mic] failed to initialize moonlight-mic/1 RS decoder"sv;
+    }
+    session.mic.packets_received = 0;
+    session.mic.frames_written = 0;
+    session.mic.decode_errors = 0;
+    session.mic.rs_recovered = 0;
+
+    if (session.broadcast_ref) {
+      mic_session_acquire(*session.broadcast_ref.get());
+    }
+
+    BOOST_LOG(info) << "[mic] session uplink started (protocol="sv
+                    << (session.mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1 ? "moonlight-mic/1"sv : "foundation-legacy"sv)
+                    << ')';
+    return 0;
+  }
+
+  void mic_session_stop(session_t &session) {
+    if (!session.mic.enabled && !session.mic.decoder && !session.mic.audio_ctx) {
+      return;
+    }
+
+    std::lock_guard lg {session.mic.lock};
+
+    if (session.broadcast_ref && session.mic.enabled) {
+      mic_session_release(*session.broadcast_ref.get());
+    }
+
+    auto *control = mic_audio_control(session);
+    if (control) {
+      if (session.mic.capture_switched) {
+        control->restore_capture_from(session.mic.capture_snap);
+        session.mic.capture_switched = false;
+      }
+      // Keep the shared backend warm for other sessions; only release when no mic sessions remain.
+      if (session.broadcast_ref && session.broadcast_ref->mic_sessions_count.load(std::memory_order_acquire) <= 0) {
+        control->release_mic_redirect_device();
+      }
+    }
+
+    session.mic.decoder.reset();
+    session.mic.rs_blocks.clear();
+    session.mic.recent_data.clear();
+    session.mic.rs.reset();
+    session.mic.pending.clear();
+    session.mic.has_playout_cursor = false;
+    session.mic.data_ssrc = 0;
+    session.mic.parity_ssrc = 0;
+    session.mic.audio_ctx = {};
+    session.mic.enabled = false;
+
+    BOOST_LOG(info) << "[mic] session uplink stopped (pkts="sv << session.mic.packets_received
+                    << ", frames="sv << session.mic.frames_written
+                    << ", dec_err="sv << session.mic.decode_errors
+                    << ", rs_rec="sv << session.mic.rs_recovered << ')';
+  }
+
+  void micRecvThread(broadcast_ctx_t &ctx) {
+    platf::set_thread_name("stream::micRecv");
+
+    auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
+    auto &io = ctx.mic_io_context;
+    auto &sock = ctx.mic_sock;
+
+    if (!ctx.mic_socket_enabled.load(std::memory_order_acquire) || !sock.is_open()) {
+      BOOST_LOG(debug) << "[mic] recv thread exiting: socket not enabled"sv;
+      return;
+    }
+
+    udp::endpoint peer;
+    std::array<char, 2048> buf {};
+    std::function<void(const boost::system::error_code &, std::size_t)> recv_handler;
+
+    recv_handler = [&](const boost::system::error_code &ec, std::size_t bytes) {
+      if (broadcast_shutdown_event->peek()) {
+        return;
+      }
+
+      auto fg = util::fail_guard([&]() {
+        if (!broadcast_shutdown_event->peek() && sock.is_open()) {
+          sock.async_receive_from(asio::buffer(buf), peer, 0, recv_handler);
+        }
+      });
+
+      if (ec == boost::system::errc::connection_refused || ec == boost::system::errc::connection_reset) {
+        return;
+      }
+      if (ec == boost::asio::error::operation_aborted) {
+        return;
+      }
+      if (ec || !bytes) {
+        if (ec) {
+          BOOST_LOG(verbose) << "[mic] recv error: "sv << ec.message();
+        }
+        return;
+      }
+
+      mic_on_packet(ctx, peer, reinterpret_cast<const std::uint8_t *>(buf.data()), bytes);
+    };
+
+    sock.async_receive_from(asio::buffer(buf), peer, 0, recv_handler);
+
+    while (!broadcast_shutdown_event->peek()) {
+      io.run();
+      if (broadcast_shutdown_event->peek()) {
+        break;
+      }
+      // run() returns when out of work; restart if the socket is still live.
+      if (!sock.is_open()) {
+        break;
+      }
+      io.restart();
+      sock.async_receive_from(asio::buffer(buf), peer, 0, recv_handler);
+    }
+
+    BOOST_LOG(debug) << "[mic] recv thread ended"sv;
+  }
+
   int start_broadcast(broadcast_ctx_t &ctx) {
     // Reset the shutdown event to ensure it's cleared even if something
     // raised it between the last end_broadcast and now.
@@ -2521,6 +3663,13 @@ namespace stream {
     ctx.video_sock.close();
     ctx.audio_sock.close();
 
+    ctx.mic_socket_enabled.store(false, std::memory_order_release);
+    {
+      boost::system::error_code ec;
+      ctx.mic_sock.close(ec);
+    }
+    ctx.mic_io_context.stop();
+
     video_packets.reset();
     audio_packets.reset();
 
@@ -2532,6 +3681,10 @@ namespace stream {
     ctx.audio_thread.join();
     BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
     ctx.control_thread.join();
+    if (ctx.mic_thread.joinable()) {
+      BOOST_LOG(debug) << "Waiting for mic thread to end..."sv;
+      ctx.mic_thread.join();
+    }
     BOOST_LOG(debug) << "All broadcasting threads ended"sv;
 
     broadcast_shutdown_event->reset();
@@ -2775,6 +3928,10 @@ namespace stream {
       join_deadline_t join_deadline {hung_stage};
 
       BOOST_LOG(debug) << "Waiting for video to end..."sv;
+      if (session.mic.enabled || session.mic.audio_ctx || session.mic.decoder) {
+        mic_session_stop(session);
+      }
+
       session.videoThread.join();
       hung_stage->store("audio thread");
       BOOST_LOG(debug) << "Waiting for audio to end..."sv;
@@ -2940,6 +4097,13 @@ namespace stream {
 
       session.audioThread = std::thread {audioThread, &session};
       session.videoThread = std::thread {videoThread, &session};
+
+      if (session.mic.enabled) {
+        if (mic_session_start(session) != 0) {
+          BOOST_LOG(warning) << "[mic] failed to arm uplink for session"sv;
+          session.mic.enabled = false;
+        }
+      }
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
 
@@ -3162,6 +4326,9 @@ namespace stream {
       session->audio.sequenceNumber = 0;
       session->audio.timestamp = 0;
 
+      session->mic.enabled = launch_session.enable_mic;
+      session->mic.protocol_version = launch_session.mic_protocol_version;
+
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
 
@@ -3170,4 +4337,31 @@ namespace stream {
       return session;
     }
   }  // namespace session
+
+  bool mic_backend_ready() {
+#ifdef _WIN32
+    if (!config::audio.stream_mic) {
+      return false;
+    }
+    return platf::mic_redirect_available();
+#else
+    return false;
+#endif
+  }
+
+  mic_status_t get_mic_status() {
+    mic_status_t status {};
+#ifdef _WIN32
+    status.capable = config::audio.stream_mic;
+    if (!status.capable) {
+      return status;
+    }
+    status.ready = mic_backend_ready();
+    status.port = net::map_port(MIC_STREAM_PORT);
+#else
+    status.capable = false;
+#endif
+    return status;
+  }
+
 }  // namespace stream

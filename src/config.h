@@ -252,6 +252,14 @@ namespace config {
     bool install_steam_drivers;
     bool keep_default;
     bool auto_capture;
+
+    // Client microphone uplink (UDP/RTP → Steam Streaming Microphone)
+    bool stream_mic;  ///< Advertise/accept mic uplink when capable
+    bool mic_require_steam;  ///< If true, DESCRIBE/SETUP mic only when Steam mic is present
+    std::string mic_sink;  ///< WASAPI render endpoint (Steam Streaming Microphone speakers side)
+    std::string mic_capture_device;  ///< Optional default capture device to select for host apps
+    int mic_buffer_ms;  ///< WASAPI render buffer hint (10-200)
+    int mic_buffer_packets;  ///< Jitter prebuffer depth in Opus packets (1-16)
   };
 
   constexpr int ENCRYPTION_MODE_NEVER = 0;  // Never use video encryption, even if the client supports it
