@@ -4231,6 +4231,18 @@ namespace nvhttp {
       tree.put("root.VirtualDisplayHDRCapable", false);
 #endif
 
+      // Client microphone uplink advertisement and protocol discovery.
+      {
+        const auto mic = stream::get_mic_status();
+        tree.put("root.MicrophoneCapable", mic.capable);
+        tree.put("root.MicrophoneReady", mic.ready);
+        if (mic.port) {
+          tree.put("root.MicrophonePort", mic.port);
+        }
+        tree.put("root.MicrophoneProtocol", "moonlight-mic");
+        tree.put("root.MicrophoneProtocolVersions", "1");
+      }
+
       // Only include the MAC address for requests sent from paired clients over HTTPS.
       // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
       if constexpr (std::is_same_v<SunshineHTTPS, T>) {

@@ -120,4 +120,9 @@ namespace platf {
   std::unique_ptr<audio_control_t> audio_control() {
     return std::make_unique<macos_audio_control_t>();
   }
+
+  bool mic_redirect_available() {
+    // The Steam Streaming Microphone redirect backend is Windows-only.
+    return false;
+  }
 }  // namespace platf

@@ -825,4 +825,9 @@ namespace platf {
 
     return audio;
   }
+
+  bool mic_redirect_available() {
+    // The Steam Streaming Microphone redirect backend is Windows-only.
+    return false;
+  }
 }  // namespace platf

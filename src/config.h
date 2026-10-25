@@ -274,6 +274,14 @@ namespace config {
     bool keep_default;
     bool auto_capture;
     bool sink_capture_only;  ///< Capture the selected Windows audio sink without changing default outputs.
+
+    // Client microphone uplink (UDP/RTP → Steam Streaming Microphone)
+    bool stream_mic;  ///< Advertise/accept the mic uplink when the platform supports it
+    bool mic_require_steam;  ///< Only advertise/accept mic when the Steam endpoint is present
+    std::string mic_sink;  ///< Render endpoint pattern written to (Steam Streaming Microphone speakers side)
+    std::string mic_capture_device;  ///< Optional default capture device to select while streaming
+    int mic_buffer_ms;  ///< WASAPI render buffer hint (10-200)
+    int mic_buffer_packets;  ///< Jitter prebuffer depth in Opus packets (1-16)
   };
 
   constexpr int ENCRYPTION_MODE_NEVER = 0;  // Never use video encryption, even if the client supports it

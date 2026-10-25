@@ -37,6 +37,7 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "utf_utils.h"
+#include "vibepollo_vmic.h"
 
 // Must be the last included file
 // clang-format off
@@ -2986,6 +2987,152 @@ namespace platf::audio {
       return 0;
     }
 
+    int init_mic_redirect_device() override {
+      if (mic_redirect_device) {
+        return 0;
+      }
+      auto device = std::make_unique<vibepollo_vmic_t>();
+      if (device->init() != 0) {
+        BOOST_LOG(warning) << "[mic] Steam Streaming Microphone unavailable"sv;
+        return -1;
+      }
+      BOOST_LOG(info) << "[mic] Steam Streaming Microphone backend initialized"sv;
+      mic_redirect_device = std::move(device);
+      return 0;
+    }
+
+    void release_mic_redirect_device() override {
+      mic_redirect_device.reset();
+      BOOST_LOG(info) << "[mic] Steam Streaming Microphone backend released"sv;
+    }
+
+    int write_mic_pcm(const float *data, std::uint32_t count) override {
+      if (!mic_redirect_device) {
+        return -1;
+      }
+      return mic_redirect_device->write_pcm(data, count);
+    }
+
+    bool mic_redirect_available() override {
+      if (mic_redirect_device) {
+        return true;
+      }
+      if (!config::audio.mic_sink.empty() && is_sink_available(config::audio.mic_sink)) {
+        return true;
+      }
+      return is_sink_available("Steam Streaming Microphone");
+    }
+
+    platf::capture_snapshot_t snapshot_capture_defaults() override {
+      platf::capture_snapshot_t snap;
+      auto get_id = [&](ERole role) -> std::string {
+        device_t dev;
+        if (FAILED(device_enum->GetDefaultAudioEndpoint(eCapture, role, &dev))) {
+          return {};
+        }
+        wstring_t id;
+        if (FAILED(dev->GetId(&id))) {
+          return {};
+        }
+        return utf_utils::to_utf8(id.get());
+      };
+      snap.console_id = get_id(eConsole);
+      snap.comms_id = get_id(eCommunications);
+      snap.multimedia_id = get_id(eMultimedia);
+      return snap;
+    }
+
+    void switch_capture_to(const std::string &device_name) override {
+      const auto target_id = find_capture_device_id(utf_utils::from_utf8(device_name));
+      if (target_id.empty()) {
+        BOOST_LOG(warning) << "[mic] switch_capture_to: device not found: " << device_name;
+        return;
+      }
+      bool any_failed = false;
+      for (int x = 0; x < static_cast<int>(ERole_enum_count); ++x) {
+        if (FAILED(policy->SetDefaultEndpoint(target_id.c_str(), static_cast<ERole>(x)))) {
+          BOOST_LOG(warning) << "[mic] SetDefaultEndpoint failed for role " << x << " on: " << device_name;
+          any_failed = true;
+        }
+      }
+      if (!any_failed) {
+        BOOST_LOG(info) << "[mic] default capture switched to: " << device_name;
+      }
+    }
+
+    void restore_capture_from(const platf::capture_snapshot_t &snap) override {
+      auto restore_role = [&](const std::string &id_utf8, ERole role) {
+        if (id_utf8.empty()) {
+          return;
+        }
+        const auto id = utf_utils::from_utf8(id_utf8);
+        policy->SetDefaultEndpoint(id.c_str(), role);
+      };
+      restore_role(snap.console_id, eConsole);
+      restore_role(snap.comms_id, eCommunications);
+      restore_role(snap.multimedia_id, eMultimedia);
+      BOOST_LOG(info) << "[mic] default capture roles restored"sv;
+    }
+
+    std::string get_current_default_capture_name() override {
+      device_t dev;
+      if (FAILED(device_enum->GetDefaultAudioEndpoint(eCapture, eConsole, &dev))) {
+        return {};
+      }
+      prop_t prop;
+      if (FAILED(dev->OpenPropertyStore(STGM_READ, &prop))) {
+        return {};
+      }
+      prop_var_t pv;
+      if (SUCCEEDED(prop->GetValue(PKEY_Device_FriendlyName, &pv.prop)) && pv.prop.vt == VT_LPWSTR) {
+        return utf_utils::to_utf8(pv.prop.pwszVal);
+      }
+      return {};
+    }
+
+    /**
+     * @brief Find an active capture endpoint id by friendly name (exact match,
+     *        then adapter-name containment for Steam mic aliases).
+     */
+    std::wstring find_capture_device_id(const std::wstring &name) {
+      collection_t collection;
+      if (FAILED(device_enum->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &collection))) {
+        return {};
+      }
+      UINT count = 0;
+      collection->GetCount(&count);
+      for (UINT i = 0; i < count; ++i) {
+        device_t dev;
+        if (FAILED(collection->Item(i, &dev))) {
+          continue;
+        }
+        prop_t prop;
+        if (FAILED(dev->OpenPropertyStore(STGM_READ, &prop))) {
+          continue;
+        }
+        prop_var_t pv;
+        if (SUCCEEDED(prop->GetValue(PKEY_Device_FriendlyName, &pv.prop)) && pv.prop.vt == VT_LPWSTR) {
+          if (std::wcscmp(pv.prop.pwszVal, name.c_str()) == 0) {
+            wstring_t id;
+            if (SUCCEEDED(dev->GetId(&id))) {
+              return std::wstring(id.get());
+            }
+          }
+        }
+        prop_var_t adapter;
+        if (SUCCEEDED(prop->GetValue(PKEY_DeviceInterface_FriendlyName, &adapter.prop)) && adapter.prop.vt == VT_LPWSTR) {
+          if (std::wcsstr(adapter.prop.pwszVal, name.c_str()) != nullptr ||
+              std::wcsstr(name.c_str(), adapter.prop.pwszVal) != nullptr) {
+            wstring_t id;
+            if (SUCCEEDED(dev->GetId(&id))) {
+              return std::wstring(id.get());
+            }
+          }
+        }
+      }
+      return {};
+    }
+
     ~audio_control_t() override = default;
 
     policy_t policy;
@@ -2993,6 +3140,7 @@ namespace platf::audio {
     role_policy_t roles_;
     std::string assigned_sink;
     std::wstring capture_device_id;
+    std::unique_ptr<mic_redirect_backend_t> mic_redirect_device;
   };
 }  // namespace platf::audio
 
@@ -3016,7 +3164,7 @@ namespace platf {
     // driver reinstall below.
     control->recover_interrupted_visibility_transition();
 
-    // Install Steam Streaming Speakers if needed. We do this during audio_control() to ensure
+    // Install Steam Streaming speakers if needed. We do this during audio_control() to ensure
     // the sink information returned includes the new Steam Streaming Speakers device.
     if (config::audio.install_steam_drivers && !control->find_device_id(control->match_steam_speakers())) {
       // This is best effort. Don't fail if it doesn't work.
@@ -3024,6 +3172,11 @@ namespace platf {
     }
 
     return control;
+  }
+
+  bool mic_redirect_available() {
+    auto control = std::make_unique<audio::audio_control_t>();
+    return control->init() == 0 && control->mic_redirect_available();
   }
 
   std::unique_ptr<deinit_t> init() {

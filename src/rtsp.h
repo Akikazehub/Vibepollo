@@ -40,6 +40,10 @@ namespace stream {
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;
 
+  /// Wire protocols a client may select for the microphone uplink.
+  constexpr std::uint8_t MIC_PROTOCOL_FOUNDATION_LEGACY = 0;
+  constexpr std::uint8_t MIC_PROTOCOL_MOONLIGHT_V1 = 1;
+
   struct launch_session_t {
     // Pending Linux launches must keep the display awake before capture and
     // until the active capture has acquired its own reference. Deliberately
@@ -103,6 +107,10 @@ namespace rtsp_stream {
     int surround_info;
     std::string surround_params;
     bool continuous_audio;
+    /// Client requested microphone uplink via RTSP SETUP stream type "mic".
+    bool enable_mic = false;
+    /// Wire protocol locked by RTSP SETUP (0=Foundation legacy, 1=moonlight-mic/1).
+    std::uint8_t mic_protocol_version = MIC_PROTOCOL_FOUNDATION_LEGACY;
     // The client's `hdrMode=1` launch flag. Every Moonlight client derives this bit from
     // `supportedVideoFormats & VIDEO_FORMAT_MASK_10BIT`, so it is also the only wire signal
     // telling us the client negotiated a 10-bit decoder profile.
