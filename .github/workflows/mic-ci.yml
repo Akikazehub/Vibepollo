@@ -20,6 +20,7 @@ jobs:
     with:
       release_commit: ${{ github.sha }}
       release_version: 1.18.4-mic
+      require_truehdr_runtime: true
       symbol_product_name: Vibepollo
       symbol_release_prefix: vibepollo
       require_signpath_signing: false
