@@ -219,7 +219,7 @@ namespace platf::audio {
     }
     util::safe_ptr<IPolicyConfig, release_com<IPolicyConfig>> policy(raw_policy);
 
-    const auto device_fmt = make_device_format_waveformat();
+    auto device_fmt = make_device_format_waveformat();
     WAVEFORMATEXTENSIBLE prev_fmt {};
     auto render_hr = policy->SetDeviceFormat(device_id.c_str(),
       reinterpret_cast<WAVEFORMATEX *>(&device_fmt),
@@ -278,7 +278,7 @@ namespace platf::audio {
       std::wstring cap_id(raw_cap_id);
       CoTaskMemFree(raw_cap_id);
 
-      const auto cap_fmt = make_device_format_waveformat();
+      auto cap_fmt = make_device_format_waveformat();
       WAVEFORMATEXTENSIBLE prev {};
       auto cap_hr = policy->SetDeviceFormat(cap_id.c_str(),
         reinterpret_cast<WAVEFORMATEX *>(&cap_fmt),
@@ -317,7 +317,7 @@ namespace platf::audio {
     // Buffer duration in REFERENCE_TIME (100ns units): ms * 10000.
     const REFERENCE_TIME buffer_duration =
       static_cast<REFERENCE_TIME>(config::audio.mic_buffer_ms) * 10000LL;
-    const auto render_fmt = make_render_waveformat();
+    auto render_fmt = make_render_waveformat();
     hr = audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED,
       AUDCLNT_STREAMFLAGS_EVENTCALLBACK, buffer_duration, 0,
       reinterpret_cast<WAVEFORMATEX *>(&render_fmt), nullptr);
