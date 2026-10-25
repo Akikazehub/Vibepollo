@@ -19,7 +19,7 @@ jobs:
     uses: ./.github/workflows/ci-windows.yml
     with:
       release_commit: ${{ github.sha }}
-      release_version: 0.0.0-mic
+      release_version: 1.18.4-mic
       symbol_product_name: Vibepollo
       symbol_release_prefix: vibepollo
       require_signpath_signing: false
