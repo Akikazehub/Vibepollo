@@ -4094,6 +4094,12 @@ namespace stream {
       return -1;
     }
 
+    // Count this session before touching the shared backend: a concurrent
+    // mic_session_stop must never observe count==0 and release the backend in
+    // the window between init_mic_redirect_device() and the old acquire point.
+    // Failure paths below must pair with a matching mic_session_release().
+    mic_session_acquire(*session.broadcast_ref.get());
+
 #ifdef _WIN32
     // Reuse the process-wide audio context so the Steam backend stays warm.
     session.mic.audio_ctx = audio::get_audio_ctx_ref();
@@ -4101,6 +4107,7 @@ namespace stream {
     if (!control) {
       BOOST_LOG(error) << "[mic] no audio control available"sv;
       session.mic.enabled = false;
+      mic_session_release(*session.broadcast_ref.get());
       return -1;
     }
 
@@ -4120,6 +4127,7 @@ namespace stream {
 #else
     BOOST_LOG(warning) << "[mic] uplink is only implemented on Windows"sv;
     session.mic.enabled = false;
+    mic_session_release(*session.broadcast_ref.get());
     return -1;
 #endif
 
@@ -4128,6 +4136,7 @@ namespace stream {
     if (!dec || err != OPUS_OK) {
       BOOST_LOG(error) << "[mic] opus_decoder_create failed: "sv << err;
       session.mic.enabled = false;
+      mic_session_release(*session.broadcast_ref.get());
       return -1;
     }
     session.mic.decoder.reset(dec);
@@ -4147,10 +4156,6 @@ namespace stream {
     session.mic.frames_written = 0;
     session.mic.decode_errors = 0;
     session.mic.rs_recovered = 0;
-
-    if (session.broadcast_ref) {
-      mic_session_acquire(*session.broadcast_ref.get());
-    }
 
     BOOST_LOG(info) << "[mic] session uplink started (protocol="sv
                     << (session.mic.protocol_version == rtsp_stream::MIC_PROTOCOL_MOONLIGHT_V1 ? "moonlight-mic/1"sv : "foundation-legacy"sv)
@@ -5507,6 +5512,14 @@ namespace stream {
 
       session->mic.enabled = launch_session.enable_mic;
       session->mic.protocol_version = launch_session.mic_protocol_version;
+
+      // Mic decryption rides the audio downlink cipher state. Sessions with
+      // audio disabled skip the block above, so initialize the two fields the
+      // uplink needs (key + IV base) for mic-only sessions.
+      if (session->mic.enabled && session->audio_disabled) {
+        session->audio.cipher = crypto::cipher::cbc_t {launch_session.gcm_key, true};
+        session->audio.avRiKeyId = util::endian::big(*(std::uint32_t *) launch_session.iv.data());
+      }
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
