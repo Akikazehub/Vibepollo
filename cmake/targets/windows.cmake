@@ -1,6 +1,8 @@
 # windows specific target definitions
 add_executable(vibepollo_dualsense_haptics "${CMAKE_SOURCE_DIR}/tools/dualsense_haptics/launcher.cpp")
-add_library(vibepollo_dualsense_audio SHARED "${CMAKE_SOURCE_DIR}/tools/dualsense_haptics/audio_hook.cpp")
+add_library(vibepollo_dualsense_audio SHARED
+        "${CMAKE_SOURCE_DIR}/tools/dualsense_haptics/audio_hook.cpp"
+        "${CMAKE_SOURCE_DIR}/tools/dualsense_haptics/fenv_compat.cpp")
 foreach(_haptics_target IN ITEMS vibepollo_dualsense_haptics vibepollo_dualsense_audio)
     target_compile_features(${_haptics_target} PRIVATE cxx_std_20)
     target_compile_definitions(${_haptics_target} PRIVATE UNICODE _UNICODE WINVER=0x0A00 _WIN32_WINNT=0x0A00 NOMINMAX)
