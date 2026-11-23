@@ -412,7 +412,15 @@ namespace crypto {
       return {};
     }
 
-    return {(const char *) ASN1_STRING_get0_data(asn1), (std::size_t) ASN1_STRING_length(asn1)};
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    const auto len = ASN1_STRING_length(asn1);
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+    return {(const char *) ASN1_STRING_get0_data(asn1), (std::size_t) len};
   }
 
   std::string_view signature(const x509_t &x) {
