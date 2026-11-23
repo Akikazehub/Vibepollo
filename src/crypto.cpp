@@ -3,6 +3,7 @@
  * @brief Definitions for cryptography functions.
  */
 // lib includes
+#include <openssl/asn1.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 
@@ -411,7 +412,7 @@ namespace crypto {
       return {};
     }
 
-    return {(const char *) asn1->data, (std::size_t) asn1->length};
+    return {(const char *) ASN1_STRING_get0_data(asn1), (std::size_t) ASN1_STRING_length(asn1)};
   }
 
   std::string_view signature(const x509_t &x) {
@@ -486,7 +487,7 @@ namespace crypto {
     X509_set_pubkey(x509.get(), pkey.get());
 
     auto name = X509_get_subject_name(x509.get());
-    X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const std::uint8_t *) cn.data(), (int) cn.size(), -1, 0);
+    X509_NAME_add_entry_by_txt(const_cast<X509_NAME *>(name), "CN", MBSTRING_ASC, (const std::uint8_t *) cn.data(), (int) cn.size(), -1, 0);
 
     X509_set_issuer_name(x509.get(), name);
     X509_sign(x509.get(), pkey.get(), EVP_sha256());

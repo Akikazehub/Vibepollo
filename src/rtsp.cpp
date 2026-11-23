@@ -2081,7 +2081,7 @@ namespace rtsp_stream {
     const auto mic_status = stream::get_mic_status();
     const bool advertise_mic = mic_status.capable &&
                                (!config::audio.mic_require_steam || mic_status.ready);
-    if (mic_status.capable) {
+    if (advertise_mic) {
       encryption_flags_supported |= SS_ENC_MIC;
     }
 

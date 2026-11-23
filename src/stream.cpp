@@ -794,6 +794,7 @@ namespace stream {
       bool enabled = false;  ///< Session requested mic (RTSP SETUP stream type "mic")
       std::uint8_t protocol_version = rtsp_stream::MIC_PROTOCOL_FOUNDATION_LEGACY;
       bool capture_switched = false;
+      bool session_acquired = false;
       platf::capture_snapshot_t capture_snap {};
       // Keep the shared audio context alive so the Steam mic backend outlives
       // this session.
@@ -3370,9 +3371,9 @@ namespace stream {
           return;
         }
       } else {
-        // Drop hopelessly late packets (more than half the seq space behind).
+        // Drop late packets that missed their playout deadline.
         const std::int16_t delta = (std::int16_t) (seq - mic.expected_seq);
-        if (delta < -16) {
+        if (delta < 0) {
           return;
         }
         mic.pending[seq] = decltype(mic.pending)::mapped_type {std::move(opus), seq};
@@ -4099,6 +4100,7 @@ namespace stream {
     // the window between init_mic_redirect_device() and the old acquire point.
     // Failure paths below must pair with a matching mic_session_release().
     mic_session_acquire(*session.broadcast_ref.get());
+    session.mic.session_acquired = true;
 
 #ifdef _WIN32
     // Reuse the process-wide audio context so the Steam backend stays warm.
@@ -4108,6 +4110,7 @@ namespace stream {
       BOOST_LOG(error) << "[mic] no audio control available"sv;
       session.mic.enabled = false;
       mic_session_release(*session.broadcast_ref.get());
+      session.mic.session_acquired = false;
       return -1;
     }
 
@@ -4128,6 +4131,7 @@ namespace stream {
     BOOST_LOG(warning) << "[mic] uplink is only implemented on Windows"sv;
     session.mic.enabled = false;
     mic_session_release(*session.broadcast_ref.get());
+    session.mic.session_acquired = false;
     return -1;
 #endif
 
@@ -4136,7 +4140,12 @@ namespace stream {
     if (!dec || err != OPUS_OK) {
       BOOST_LOG(error) << "[mic] opus_decoder_create failed: "sv << err;
       session.mic.enabled = false;
+      if (session.mic.capture_switched) {
+        control->restore_capture_from(session.mic.capture_snap);
+        session.mic.capture_switched = false;
+      }
       mic_session_release(*session.broadcast_ref.get());
+      session.mic.session_acquired = false;
       return -1;
     }
     session.mic.decoder.reset(dec);
@@ -4164,14 +4173,15 @@ namespace stream {
   }
 
   void mic_session_stop(session_t &session) {
-    if (!session.mic.enabled && !session.mic.decoder && !session.mic.audio_ctx) {
+    if (!session.mic.enabled && !session.mic.decoder && !session.mic.audio_ctx && !session.mic.session_acquired) {
       return;
     }
 
     std::lock_guard lg {session.mic.lock};
 
-    if (session.broadcast_ref && session.mic.enabled) {
+    if (session.broadcast_ref && session.mic.session_acquired) {
       mic_session_release(*session.broadcast_ref.get());
+      session.mic.session_acquired = false;
     }
 
     auto *control = mic_audio_control(session);

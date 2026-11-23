@@ -340,14 +340,16 @@ namespace platf::audio {
                          << util::hex(hr).to_string_view();
       return false;
     }
-    audio_render = raw_render;
+    audio_render.reset(raw_render);
 
-    HANDLE evt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
-    if (!evt) {
-      BOOST_LOG(warning) << "[mic] initialize_device: CreateEvent failed"sv;
-      return false;
+    if (!render_event) {
+      HANDLE evt = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+      if (!evt) {
+        BOOST_LOG(warning) << "[mic] initialize_device: CreateEvent failed"sv;
+        return false;
+      }
+      render_event.reset(evt);
     }
-    render_event.reset(evt);
     audio_client->SetEventHandle(render_event.get());
 
     hr = audio_client->Start();
@@ -420,10 +422,7 @@ namespace platf::audio {
                            << util::hex(pad_hr).to_string_view()
                            << " — attempting WASAPI re-init"sv;
         if (audio_client) audio_client->Stop();
-        if (audio_render) {
-          audio_render->Release();
-          audio_render = nullptr;
-        }
+        audio_render.reset();
         audio_client.reset();
         std::wstring device_id;
         if (!find_target_device(device_id) || !initialize_device(device_id)) {
@@ -457,11 +456,16 @@ namespace platf::audio {
       auto *dst = reinterpret_cast<float *>(buf);
       {
         std::lock_guard<std::mutex> lk(queue_mutex);
-        for (UINT32 f = 0; f < to_write; ++f) {
+        UINT32 f = 0;
+        for (; f < to_write && !pending_frames.empty(); ++f) {
           const float s = pending_frames.front();
           pending_frames.pop_front();
           dst[f * 2] = s;
           dst[f * 2 + 1] = s;
+        }
+        for (; f < to_write; ++f) {
+          dst[f * 2] = 0.0f;
+          dst[f * 2 + 1] = 0.0f;
         }
       }
       audio_render->ReleaseBuffer(to_write, 0);
@@ -475,10 +479,7 @@ namespace platf::audio {
     if (render_event) SetEvent(render_event.get());
     if (render_thread.joinable()) render_thread.join();
     if (audio_client) audio_client->Stop();
-    if (audio_render) {
-      audio_render->Release();
-      audio_render = nullptr;
-    }
+    audio_render.reset();
   }
 
 }  // namespace platf::audio

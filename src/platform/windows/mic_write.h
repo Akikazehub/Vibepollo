@@ -79,7 +79,7 @@ namespace platf::audio {
 
     util::safe_ptr<IMMDeviceEnumerator, release_com<IMMDeviceEnumerator>> device_enum;
     util::safe_ptr<IAudioClient, release_com<IAudioClient>> audio_client;
-    IAudioRenderClient *audio_render = nullptr;
+    util::safe_ptr<IAudioRenderClient, release_com<IAudioRenderClient>> audio_render;
     UINT32 buffer_frame_count = 0;
     std::string target_device_name;
     bool first_write_logged = false;
