@@ -1015,6 +1015,7 @@ namespace config {
 
     0,  // pacing_max_bitrate_kbps (0 = legacy 1 Gbps Ethernet assumption)
     0,  // packetsize (0 = off)
+    true,  // qos_tagging (DSCP QoS marking on audio/video UDP; disable for WiFi drivers that mishandle WMM voice queues)
   };
 
   nvhttp_t nvhttp {
@@ -2216,6 +2217,8 @@ namespace config {
 
     int_between_f(vars, "lan_encryption_mode", stream.lan_encryption_mode, {0, 2});
     int_between_f(vars, "wan_encryption_mode", stream.wan_encryption_mode, {0, 2});
+
+    bool_f(vars, "qos_tagging", stream.qos_tagging);
 
     path_f(vars, "file_apps", stream.file_apps);
 #ifndef __ANDROID__

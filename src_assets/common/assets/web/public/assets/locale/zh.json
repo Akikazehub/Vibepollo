@@ -859,6 +859,8 @@
     "restart_note": "正在重启 Vibepollo 以应用更改。",
     "stream_audio": "流音频",
     "stream_audio_desc": "是否播放音频。禁用此选项可有助于流媒体无头显示作为第二个显示器。",
+    "qos_tagging": "QoS 流量标记（DSCP/WMM）",
+    "qos_tagging_desc": "在客户端请求时，为音频和视频流打上 DSCP QoS 标记（Windows 上通过 qWAVE/WMM 设置优先级）。禁用后 Windows 将完全不做 QoS 标记；Linux/macOS 仍保留本地套接字优先级。Windows 主机接入对优先级队列处理异常的 WiFi 设备（例如部分智能电视在 WMM 语音队列上音频卡死）时可禁用此项。更改对新会话生效。",
     "sunshine_name": "Vibepollo 主机名称",
     "sunshine_name_desc": "在 Moonlight 中显示的名称。如果未指定，则使用 PC 的主机名",
     "sw_preset": "软件编码预设",

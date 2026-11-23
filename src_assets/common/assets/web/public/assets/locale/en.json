@@ -977,6 +977,8 @@
     "restart_note": "Vibepollo is restarting to apply changes.",
     "stream_audio": "Stream Audio",
     "stream_audio_desc": "Whether to stream audio or not. Disabling this can be useful for streaming headless displays as second monitors.",
+    "qos_tagging": "QoS Traffic Tagging (DSCP/WMM)",
+    "qos_tagging_desc": "Tag audio and video streams with DSCP QoS markings when the client requests them (qWAVE/WMM priority on Windows). Disabling removes all QoS tagging on Windows; Linux/macOS keep local socket prioritization. Disable on a Windows host for networks whose WiFi hardware mishandles prioritized traffic, e.g. smart TVs that freeze audio on WMM voice queues. Applies to new sessions.",
     "sunshine_name": "Vibepollo Name",
     "sunshine_name_desc": "The name displayed by Moonlight. If not specified, the PC's hostname is used",
     "sw_preset": "SW Presets",

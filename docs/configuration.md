@@ -2618,6 +2618,34 @@ These settings are host-wide and are not application runtime overrides.
     </tr>
 </table>
 
+### qos_tagging
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Tag audio and video UDP traffic with DSCP QoS markings when the client requests them
+            (qWAVE/WMM voice priority on Windows). Disabling it removes all QoS tagging on Windows;
+            Linux and macOS still apply local socket prioritization. Disable this option on a
+            Windows host for networks whose WiFi hardware mishandles prioritized traffic, for
+            example smart TVs that freeze audio on WMM voice queues. The change applies to newly
+            started sessions.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            qos_tagging = disabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### control_peer_timeout
 
 <table>

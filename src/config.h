@@ -309,6 +309,10 @@ namespace config {
 
     // Limit the packetsize to avoid fragmentation on a low MTU link. 0 = off.
     int packetsize;
+
+    // Tag audio/video UDP traffic with DSCP QoS markings when the client requests
+    // them. Disable for networks whose WiFi hardware mishandles WMM voice queues.
+    bool qos_tagging;
   };
 
   struct nvhttp_t {
