@@ -12,6 +12,11 @@ endforeach()
 target_link_options(vibepollo_dualsense_haptics PRIVATE -municode)
 target_link_libraries(vibepollo_dualsense_haptics PRIVATE setupapi)
 target_link_libraries(vibepollo_dualsense_audio PRIVATE minhook::minhook ole32 propsys uuid shell32)
+# Older mingw-w64 CRTs ship no __mingw_fe_dfl_env for static links (see
+# tools/dualsense_haptics/fenv_compat.cpp); newer CRTs define it in
+# libmingwex again. Keep the first definition encountered — our object,
+# which is equivalent (zeroed = FE_DFL_ENV on x86_64).
+target_link_options(vibepollo_dualsense_audio PRIVATE -Wl,--allow-multiple-definition)
 add_dependencies(sunshine vibepollo_dualsense_haptics vibepollo_dualsense_audio)
 if(DEFINED _MINHOOK_DLL)
     add_custom_command(TARGET vibepollo_dualsense_audio POST_BUILD

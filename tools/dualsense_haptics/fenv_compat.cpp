@@ -6,6 +6,11 @@
 // fesetenv in transitively). Supply the default floating-point environment
 // locally. A zero-initialized fenv_t matches FE_DFL_ENV on x86_64 (all
 // exception flags clear, default rounding mode) for these code paths.
+//
+// CRT r59x archived the definition again, so this object now collides with
+// libmingwex. vibepollo_dualsense_audio links with
+// -Wl,--allow-multiple-definition to keep the first definition encountered;
+// our object precedes the CRT archives and both definitions are equivalent.
 #include <fenv.h>
 
 extern "C" const fenv_t __mingw_fe_dfl_env = {};
